@@ -1,0 +1,30 @@
+{
+  "name": "openfox-telegram",
+  "version": "1.0.0",
+  "description": "Drive OpenFox from Telegram: projects, sessions, agent turns, questions and permission requests.",
+  "type": "module",
+  "main": "./src/index.js",
+  "openfox": {
+    "apiVersion": 2,
+    "displayName": "Telegram Bridge",
+    "description": "Drive OpenFox from Telegram: pick a project and a session, send tasks, follow the agent, answer its questions and permission requests.",
+    "entry": "./src/index.js",
+    "capabilities": [
+      "settings",
+      "ui",
+      "rpc"
+    ],
+    "icon": "data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAyNDAgMjQwIj48Y2lyY2xlIGN4PSIxMjAiIGN5PSIxMjAiIHI9IjEyMCIgZmlsbD0iIzJBQUJFRSIvPjxwYXRoIGZpbGw9IiNmZmYiIGQ9Ik01NC4zIDExOC44YzM1LTE1LjIgNTguMy0yNS4zIDcwLTMwLjIgMzMuMy0xMy45IDQwLjMtMTYuMyA0NC44LTE2LjQgMSAwIDMuMi4yIDQuNyAxLjQgMS4yIDEgMS41IDIuMyAxLjcgMy4zLjIgMSAuNCAzLjEuMiA0LjctMS44IDE5LTkuNiA2NS4xLTEzLjYgODYuMy0xLjcgOS01IDEyLTguMiAxMi4zLTcgLjYtMTIuMy00LjYtMTktOS0xMC42LTYuOS0xNi41LTExLjItMjYuOC0xOC0xMS45LTcuOC00LjItMTIuMSAyLjYtMTkuMSAxLjgtMS44IDMyLjUtMjkuOCAzMy4xLTMyLjMuMS0uMy4xLTEuNS0uNi0yLjEtLjctLjYtMS43LS40LTIuNS0uMi0xLjEuMi0xNy45IDExLjQtNTAuNiAzMy41LTQuOCAzLjMtOS4xIDQuOS0xMyA0LjgtNC4zLS4xLTEyLjUtMi40LTE4LjctNC40LTcuNS0yLjQtMTMuNS0zLjctMTMtNy45LjMtMi4yIDMuMy00LjQgOC45LTYuN3oiLz48L3N2Zz4="
+  },
+  "scripts": {
+    "test": "node --test src/index.test.js"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/vv7r/openfox-telegram"
+  }
+}
