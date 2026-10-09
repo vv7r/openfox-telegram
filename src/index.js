@@ -28,6 +28,14 @@ const LONG_ANSWER_CHARS = 7000
 // Characters shown per message in the history of a session that is opened.
 const HISTORY_MESSAGE_CHARS = 500
 
+// The runtime is stored in globalThis so that a re-import of this module can
+// still reach and stop the previous runtime. OpenFox re-imports plugins with a
+// cache-bust query string (?v=...), which creates a fresh ESM module instance
+// where the module-scoped `runtime` is undefined; without a shared reference,
+// each (re)load would leak a runtime whose poll loop and watchers keep
+// forwarding every answer multiple times.
+const RUNTIME_KEY = Symbol.for('openfox-telegram-runtime')
+
 // Commands registered with Telegram via setMyCommands: typing "/" lists them.
 // French by default, English for Telegram apps set to English. Names are
 // a-z, 0-9 and "_" only; descriptions at most 256 characters.
@@ -559,6 +567,11 @@ export class TelegramClient {
     this.token = cleanBotToken(token)
     this.fetch = fetchImpl ?? fetch
     this.requestTimeoutMs = requestTimeoutMs ?? REQUEST_TIMEOUT_MS
+    this._abortController = new AbortController()
+  }
+
+  abort() {
+    this._abortController.abort()
   }
 
   // Every request has a time limit: a connection that stalls without closing
@@ -571,7 +584,7 @@ export class TelegramClient {
       method: 'POST',
       ...(form ? {} : { headers: { 'Content-Type': 'application/json' } }),
       body: form ? params : JSON.stringify(params),
-      signal: AbortSignal.timeout(timeoutMs),
+      signal: AbortSignal.any([AbortSignal.timeout(timeoutMs), this._abortController.signal]),
     })
     let data
     try {
@@ -2135,6 +2148,7 @@ export function createRuntime({ telegram, rest, subscribe, logger, auth = {}, hi
     stop() {
       stopped = true
       clearInterval(followTimer)
+      telegram.abort()
       for (const conv of conversations.values()) {
         try {
           conv.closeWatcher()
@@ -2343,6 +2357,13 @@ const STATUS_FOOTER = [
 let runtime = null
 
 export function register(registry) {
+  // Stop the previous runtime via globalThis: on a cache-bust re-import this
+  // module is a fresh ESM instance whose module-scoped `runtime` is undefined,
+  // so only the shared globalThis reference can reach the old runtime.
+  const oldRuntime = globalThis[RUNTIME_KEY]
+  oldRuntime?.stop()
+  globalThis[RUNTIME_KEY] = null
+  runtime = null
   const { context } = registry
 
   registry.registerSettings({
@@ -2502,6 +2523,7 @@ export function register(registry) {
     follow: () => context.settings().followSession,
     storage: context.storage,
   })
+  globalThis[RUNTIME_KEY] = runtime
   runtime.start()
   context.logger.info('openfox-telegram started', { baseUrl })
   if (!authorizedUserId) {
@@ -2510,6 +2532,10 @@ export function register(registry) {
 }
 
 export function deactivate() {
-  runtime?.stop()
+  // Stop via globalThis too, so a deactivate from a fresh module instance
+  // (cache-bust re-import) still reaches the live runtime.
+  const oldRuntime = globalThis[RUNTIME_KEY]
+  oldRuntime?.stop()
+  globalThis[RUNTIME_KEY] = null
   runtime = null
 }

@@ -19,12 +19,23 @@ import {
   createWsSubscribe,
   resolveBaseUrl,
   statusPanelContent,
+  deactivate,
 } from './index.js'
+import { pathToFileURL, fileURLToPath } from 'node:url'
+import { join, dirname } from 'node:path'
 
 const noopLogger = { debug() {}, info() {}, warn() {}, error() {} }
 
 function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms))
+}
+
+const RUNTIME_KEY = Symbol.for('openfox-telegram-runtime')
+const MODULE_URL = pathToFileURL(join(dirname(fileURLToPath(import.meta.url)), 'index.js')).href
+async function importFreshModule() {
+  // Simulate OpenFox's cache-bust re-import (?v=...): a fresh ESM module
+  // instance each call, so the module-scoped `runtime` is NOT shared.
+  return import(`${MODULE_URL}?v=${Date.now()}-${Math.random()}`)
 }
 
 // A fake Telegram client that records sent messages and answered callbacks,
@@ -52,6 +63,7 @@ function fakeTelegram() {
       return updates.splice(0)
     },
     async setMyCommands() {},
+    abort() {},
     _push(u) {
       updates.push(u)
     },
@@ -4110,4 +4122,60 @@ test('a project name follows OpenFox rules: letters, digits, dot, dash, undersco
   assert.deepEqual(created, [])
   await conv.handleText('/new Mon_site-2.0 v1')
   assert.deepEqual(created, ['/srv/Mon_site-2.0 v1'])
+})
+
+// ---------------------------------------------------------------------------
+// Re-import (cache-bust) stops the previous runtime
+// ---------------------------------------------------------------------------
+
+test('re-import (cache-bust) stops the previous runtime', async () => {
+  // Fake the network so register() does not hit the real server.
+  const realFetch = globalThis.fetch
+  const realWebSocket = globalThis.WebSocket
+  globalThis.fetch = async () => ({ status: 200, json: async () => ({}) })
+  globalThis.WebSocket = class { constructor() {} close() {} }
+
+  const moduleA = await importFreshModule()
+  const stopped = []
+  const spyStop = () => { stopped.push(1) }
+
+  // Register the first runtime.
+  moduleA.register({
+    registerSettings() {},
+    context: {
+      settings: () => ({ botToken: '123:abc', authorizedUserId: '1', followSession: false, historyCount: 6, historyChars: 500, displayLocale: 'fr' }),
+      storage: { get: () => null, set: () => {} },
+      logger: noopLogger,
+    },
+  })
+
+  // Wrap stop so it records the call AND actually stops the poll loop.
+  const runtimeA = globalThis[RUNTIME_KEY]
+  assert.ok(runtimeA, 'register should store the runtime in globalThis')
+  const originalStop = runtimeA.stop
+  runtimeA.stop = () => { stopped.push(1); originalStop() }
+
+  // Re-import: a fresh module instance (cache-bust).
+  const moduleB = await importFreshModule()
+  moduleB.register({
+    registerSettings() {},
+    context: {
+      settings: () => ({ botToken: '123:abc', authorizedUserId: '1', followSession: false, historyCount: 6, historyChars: 500, displayLocale: 'fr' }),
+      storage: { get: () => null, set: () => {} },
+      logger: noopLogger,
+    },
+  })
+
+  // The previous runtime's stop must have been called.
+  assert.equal(stopped.length, 1, 'the previous runtime should be stopped on re-import')
+
+  // The new runtime is stored in globalThis.
+  const runtimeB = globalThis[RUNTIME_KEY]
+  assert.ok(runtimeB, 'the new runtime should be stored in globalThis')
+  assert.notEqual(runtimeA, runtimeB, 'the new runtime should be a different instance')
+
+  // Cleanup.
+  runtimeB.stop()
+  globalThis.fetch = realFetch
+  globalThis.WebSocket = realWebSocket
 })

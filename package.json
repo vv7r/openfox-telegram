@@ -1,6 +1,6 @@
 {
   "name": "openfox-telegram",
-  "version": "1.0.2",
+  "version": "1.0.3",
   "description": "Drive OpenFox from Telegram: projects, sessions, agent turns, questions and permission requests.",
   "type": "module",
   "main": "./src/index.js",
