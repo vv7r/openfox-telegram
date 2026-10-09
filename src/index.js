@@ -932,6 +932,19 @@ export class Conversation {
       for (const [token, q] of this.state.pendingQuestions) {
         if (q.sessionId === sessionId) this.state.pendingQuestions.delete(token)
       }
+      // Remove the buttons from path confirmations of this turn.
+      if (this.state.pendingPathConfirms) {
+        for (const [callId, entry] of this.state.pendingPathConfirms) {
+          if (entry.sessionId === sessionId) {
+            this.logger.info('telegram: finish() removing path confirmation buttons', { callId, messageId: entry.messageId })
+            if (entry.messageId) {
+              void this.telegram.editMessageReplyMarkup(this.chatId, entry.messageId, { inline_keyboard: [] })
+                .catch((e) => this.logger.error('telegram: editMessageReplyMarkup failed', { callId, messageId: entry.messageId, error: e?.message }))
+            }
+            this.state.pendingPathConfirms.delete(callId)
+          }
+        }
+      }
       cleanup?.()
       resolveDone()
       if (this._abortTurn === finish) this._abortTurn = null
@@ -1046,7 +1059,6 @@ export class Conversation {
     const reasonText = this.t(reason === 'dangerous_command' ? 'path_reason_dangerous' : 'path_reason_outside')
     const text = `🔒 ${tool} · ${reasonText}\n${pathList}`
     if (!this.state.pendingPathConfirms) this.state.pendingPathConfirms = new Map()
-    this.state.pendingPathConfirms.set(callId, sessionId)
     const keyboard = {
       inline_keyboard: [
         [
@@ -1056,7 +1068,15 @@ export class Conversation {
         [{ text: this.t('path_always'), callback_data: `path_confirm:${callId}:always` }],
       ],
     }
+    this.state.pendingPathConfirms.set(callId, { sessionId, messageId: null })
+    this.logger.info('telegram: _showPathConfirmation', { callId, tool, paths, reason })
     void this.telegram.sendMessage(this.chatId, text, { reply_markup: keyboard })
+      .then((msg) => {
+        const entry = this.state.pendingPathConfirms.get(callId)
+        if (entry) entry.messageId = msg?.message_id ?? null
+        this.logger.info('telegram: _showPathConfirmation messageId set', { callId, messageId: msg?.message_id ?? null })
+      })
+      .catch((e) => this.logger.error('telegram: _showPathConfirmation sendMessage failed', { callId, error: e?.message }))
   }
 
   /** A question of the agent: buttons for a choice or a confirmation; a typed message also answers it. */
@@ -1171,6 +1191,19 @@ export class Conversation {
         return
       }
       if (!TURN_END_REASONS.has(p.reason)) return
+      // Remove the buttons from path confirmations of this session.
+      if (this.state.pendingPathConfirms) {
+        for (const [callId, entry] of this.state.pendingPathConfirms) {
+          if (entry.sessionId === sessionId) {
+            this.logger.info('telegram: watcher chat.done removing path confirmation buttons', { callId, messageId: entry.messageId })
+            if (entry.messageId) {
+              void this.telegram.editMessageReplyMarkup(this.chatId, entry.messageId, { inline_keyboard: [] })
+                .catch((e) => this.logger.error('telegram: editMessageReplyMarkup failed', { callId, messageId: entry.messageId, error: e?.message }))
+            }
+            this.state.pendingPathConfirms.delete(callId)
+          }
+        }
+      }
       this._emitWatchedText(watcher, p.messageId)
       const changes = watcher.changes
       watcher.changes = new FileChanges()
@@ -1777,9 +1810,19 @@ export class Conversation {
       const idx = data.lastIndexOf(':')
       const callId = data.slice(13, idx)
       const action = data.slice(idx + 1)
-      const sessionId = this.state.pendingPathConfirms?.get(callId) ?? this.state.sessionId
+      const entry = this.state.pendingPathConfirms?.get(callId)
+      const sessionId = entry?.sessionId ?? this.state.sessionId
       this.state.pendingPathConfirms?.delete(callId)
-      this.logger.info('telegram: path_confirm callback', { data, sessionId, callId, action })
+      this.logger.info('telegram: path_confirm callback', { data, sessionId, callId, action, entryMessageId: entry?.messageId ?? null })
+      // Remove the buttons immediately: the confirmation is being resolved,
+      // whether from Telegram or from OpenFox.
+      if (entry?.messageId) {
+        void this.telegram.editMessageReplyMarkup(this.chatId, entry.messageId, { inline_keyboard: [] })
+          .then(() => this.logger.info('telegram: buttons removed via handleCallback', { callId, messageId: entry.messageId }))
+          .catch((err) => this.logger.error('telegram: editMessageReplyMarkup failed in handleCallback', { callId, messageId: entry.messageId, error: err?.message }))
+      } else {
+        this.logger.info('telegram: no messageId to remove buttons in handleCallback', { callId })
+      }
       if (!sessionId) {
         return this.telegram.sendMessage(this.chatId, this.t('no_active_session'), { reply_markup: menuKeyboard({ session: false }) })
       }

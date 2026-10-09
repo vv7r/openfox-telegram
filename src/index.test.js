@@ -1901,6 +1901,7 @@ test('handleCallback path_confirm:allow calls confirmPath with approved=true', a
   const telegram = {
     sendMessage: async (chatId, text) => {},
     sendChatAction: async () => {},
+    editMessageReplyMarkup: async () => {},
   }
   const rest = {
     sendMessage: async () => {},
@@ -1910,7 +1911,7 @@ test('handleCallback path_confirm:allow calls confirmPath with approved=true', a
   }
   const conv = new Conversation({ chatId: 'c1', telegram, rest, subscribe: fakeSubscribe().subscribe, logger: noopLogger })
   conv.state.sessionId = 's1'
-  conv.state.pendingPathConfirms = new Map([['abc:def', 's1']])
+  conv.state.pendingPathConfirms = new Map([['abc:def', { sessionId: 's1', messageId: 'pc1' }]])
 
   await conv.handleCallback('path_confirm:abc:def:allow')
 
@@ -1926,6 +1927,7 @@ test('handleCallback path_confirm:deny calls confirmPath with approved=false', a
   const telegram = {
     sendMessage: async (chatId, text) => {},
     sendChatAction: async () => {},
+    editMessageReplyMarkup: async () => {},
   }
   const rest = {
     sendMessage: async () => {},
@@ -1935,7 +1937,7 @@ test('handleCallback path_confirm:deny calls confirmPath with approved=false', a
   }
   const conv = new Conversation({ chatId: 'c1', telegram, rest, subscribe: fakeSubscribe().subscribe, logger: noopLogger })
   conv.state.sessionId = 's1'
-  conv.state.pendingPathConfirms = new Map([['abc:def', 's1']])
+  conv.state.pendingPathConfirms = new Map([['abc:def', { sessionId: 's1', messageId: 'pc1' }]])
 
   await conv.handleCallback('path_confirm:abc:def:deny')
 
@@ -1948,6 +1950,7 @@ test('handleCallback path_confirm:always calls confirmPath with alwaysAllow=true
   const telegram = {
     sendMessage: async (chatId, text) => {},
     sendChatAction: async () => {},
+    editMessageReplyMarkup: async () => {},
   }
   const rest = {
     sendMessage: async () => {},
@@ -1957,7 +1960,7 @@ test('handleCallback path_confirm:always calls confirmPath with alwaysAllow=true
   }
   const conv = new Conversation({ chatId: 'c1', telegram, rest, subscribe: fakeSubscribe().subscribe, logger: noopLogger })
   conv.state.sessionId = 's1'
-  conv.state.pendingPathConfirms = new Map([['abc:def', 's1']])
+  conv.state.pendingPathConfirms = new Map([['abc:def', { sessionId: 's1', messageId: 'pc1' }]])
 
   await conv.handleCallback('path_confirm:abc:def:always')
 
@@ -1972,6 +1975,7 @@ test('handleCallback path_confirm:always also sets danger level to dangerous', a
   const telegram = {
     sendMessage: async (chatId, text) => {},
     sendChatAction: async () => {},
+    editMessageReplyMarkup: async () => {},
   }
   const rest = {
     sendMessage: async () => {},
@@ -1984,7 +1988,7 @@ test('handleCallback path_confirm:always also sets danger level to dangerous', a
   }
   const conv = new Conversation({ chatId: 'c1', telegram, rest, subscribe: fakeSubscribe().subscribe, logger: noopLogger })
   conv.state.sessionId = 's1'
-  conv.state.pendingPathConfirms = new Map([['abc:def', 's1']])
+  conv.state.pendingPathConfirms = new Map([['abc:def', { sessionId: 's1', messageId: 'pc1' }]])
 
   await conv.handleCallback('path_confirm:abc:def:always')
 
@@ -1998,6 +2002,7 @@ test('handleCallback path_confirm:allow does NOT set danger level', async () => 
   const telegram = {
     sendMessage: async (chatId, text) => {},
     sendChatAction: async () => {},
+    editMessageReplyMarkup: async () => {},
   }
   const rest = {
     sendMessage: async () => {},
@@ -2008,11 +2013,45 @@ test('handleCallback path_confirm:allow does NOT set danger level', async () => 
   }
   const conv = new Conversation({ chatId: 'c1', telegram, rest, subscribe: fakeSubscribe().subscribe, logger: noopLogger })
   conv.state.sessionId = 's1'
-  conv.state.pendingPathConfirms = new Map([['abc:def', 's1']])
+  conv.state.pendingPathConfirms = new Map([['abc:def', { sessionId: 's1', messageId: 'pc1' }]])
 
   await conv.handleCallback('path_confirm:abc:def:allow')
 
   assert.equal(dangerCalls.length, 0)
+})
+
+test('path confirmation buttons are removed when the turn ends', async () => {
+  const edited = []
+  const telegram = {
+    sendMessage: async (chatId, text, extra) => {
+      if (extra?.reply_markup) return { message_id: 'pc1' }
+      return { message_id: 'm1' }
+    },
+    sendChatAction: async () => {},
+    editMessageReplyMarkup: async (chatId, messageId, markup) => { edited.push({ chatId, messageId, markup }) },
+  }
+  const rest = { sendMessage: async () => {} }
+  const { subscribe, registered } = fakeSubscribe()
+  const conv = new Conversation({ chatId: 'c1', telegram, rest, subscribe, logger: noopLogger })
+  const p = conv.handleText('/send s1 test path')
+  assert.ok(await until(() => registered.length > 0), 'the turn should have subscribed')
+  const onEvent = registered[0].onEvent
+
+  // The agent requests a path confirmation.
+  onEvent({ type: 'chat.path_confirmation', payload: { callId: 'pc1', tool: 'bash', paths: ['/etc'], reason: 'outside' } })
+  // Let the .then() from _showPathConfirmation set the messageId.
+  await new Promise((r) => setImmediate(r))
+  // The agent continues and the turn ends.
+  onEvent({ type: 'chat.delta', payload: { messageId: 'a1', content: 'done' } })
+  onEvent({ type: 'chat.done', payload: { messageId: 'a1', reason: 'complete' } })
+  await p
+
+  // The buttons were removed from the confirmation message.
+  assert.equal(edited.length, 1)
+  assert.equal(edited[0].messageId, 'pc1')
+  assert.deepEqual(edited[0].markup, { inline_keyboard: [] })
+  // The pendingPathConfirms map is cleared.
+  assert.equal(conv.state.pendingPathConfirms.size, 0)
 })
 
 test('handleCallback path_confirm falls back to state.sessionId when no pendingPathConfirms', async () => {
@@ -2020,6 +2059,7 @@ test('handleCallback path_confirm falls back to state.sessionId when no pendingP
   const telegram = {
     sendMessage: async (chatId, text) => {},
     sendChatAction: async () => {},
+    editMessageReplyMarkup: async () => {},
   }
   const rest = {
     sendMessage: async () => {},
@@ -2719,6 +2759,7 @@ function progressTelegram() {
     return { message_id: nextId++ }
   }
   t.editMessageText = async (chatId, messageId, text, extra) => { edits.push({ messageId, text, extra }) }
+  t.editMessageReplyMarkup = async (chatId, messageId, markup) => { edits.push({ messageId, markup }) }
   t.edits = edits
   return t
 }
@@ -3619,6 +3660,21 @@ test('runtime: with follow on, the saved session is watched from the start', asy
   r.stop()
   assert.ok(ok)
   assert.equal(ms.open().length, 0, 'closed on stop')
+})
+
+test('follow: path confirmation buttons are removed when the OpenFox turn ends', async () => {
+  const { conv, telegram, open } = followConv()
+  conv.syncWatcher()
+  const ev = open()[0].onEvent
+  ev({ type: 'chat.path_confirmation', payload: { callId: 'p1', tool: 'run_command', paths: ['/etc'], reason: 'outside_workdir' } })
+  await new Promise((r) => setImmediate(r))
+  ev({ type: 'chat.delta', payload: { messageId: 'w1', content: 'Fait.' } })
+  ev({ type: 'chat.done', payload: { messageId: 'w1', reason: 'complete' } })
+  await sleep(10)
+  const edits = telegram.edits.filter((e) => e.markup !== undefined)
+  assert.equal(edits.length, 1, JSON.stringify(telegram.edits))
+  assert.deepEqual(edits[0].markup, { inline_keyboard: [] })
+  assert.equal(conv.state.pendingPathConfirms.size, 0)
 })
 
 test('follow: a message sent while an OpenFox turn runs is queued, and both answers come through the watcher', async () => {
