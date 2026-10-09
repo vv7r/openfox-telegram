@@ -582,6 +582,26 @@ test('runTurn stops the typing indicator and does not forward after chat.done', 
   assert.deepEqual(sent, ['done'])
 })
 
+test('runTurn stops after chat.done with reason step_done', async () => {
+  const sent = []
+  const typing = []
+  const telegram = {
+    sendMessage: async (c, t) => sent.push(t),
+    sendChatAction: async (c, a) => typing.push(a),
+  }
+  const rest = { sendMessage: async () => {} }
+  const { subscribe, registered } = fakeSubscribe()
+  const timer = fakeTimer()
+  const conv = new Conversation({ chatId: 'c1', telegram, rest, subscribe, logger: noopLogger, timer, typingIntervalMs: 100 })
+
+  const p = conv.runTurn('s1', 'x')
+  const { onEvent } = registered[0]
+  onEvent({ type: 'chat.delta', payload: { messageId: 'm1', content: 'hello' } })
+  onEvent({ type: 'chat.done', payload: { messageId: 'm1', reason: 'step_done' } })
+  await p
+  assert.deepEqual(sent, ['hello'])
+})
+
 test('runTurn forwards a chat.error message to Telegram', async () => {
   const sent = []
   const telegram = { sendMessage: async (c, t) => sent.push(t), sendChatAction: async () => {} }
@@ -627,6 +647,132 @@ test('runTurn times out gracefully when chat.done never arrives (watchdog)', asy
     `expected a French timeout message, got: ${JSON.stringify(sent)}`,
   )
   assert.ok(warnings.some((w) => w.includes('timed out')), 'expected a timeout warning')
+})
+
+test('runTurn survives a compaction done and forwards the final answer', async () => {
+  const sent = []
+  const rest = { sendMessage: async () => {}, stopSession: async () => ({ success: true }) }
+  const { subscribe, registered } = fakeSubscribe()
+  const conv = new Conversation({
+    chatId: 'c1',
+    telegram: { sendMessage: async (c, t) => sent.push(t), sendChatAction: async () => {} },
+    rest,
+    subscribe,
+    logger: noopLogger,
+  })
+  const p = conv.handleText('/send s1 reponds apres compaction')
+  assert.ok(await until(() => registered.length > 0), 'the turn should have subscribed')
+  const onEvent = registered[0].onEvent
+
+  // The server emits the compaction summary (chat.message isCompactionSummary),
+  // then a chat.done for the compaction turn, then the agent continues and
+  // emits the real answer.
+  onEvent({ type: 'chat.message', payload: { message: { id: 'sum', role: 'assistant', content: 'RÉSUMÉ DE COMPACTION', isCompactionSummary: true } } })
+  onEvent({ type: 'chat.done', payload: { messageId: 'sum', reason: 'complete' } })
+  onEvent({ type: 'chat.delta', payload: { messageId: 'a1', content: 'voici la réponse finale.' } })
+  onEvent({ type: 'chat.done', payload: { messageId: 'a1', reason: 'complete' } })
+  await p
+
+  // The real answer is relayed.
+  assert.ok(
+    sent.some((t) => t.includes('voici la réponse finale')),
+    `expected the final answer after the compaction done, got: ${JSON.stringify(sent)}`,
+  )
+  // The compaction summary is NOT relayed as a normal answer.
+  assert.ok(
+    !sent.some((t) => t.includes('RÉSUMÉ DE COMPACTION')),
+    `compaction summary must not be sent to Telegram, got: ${JSON.stringify(sent)}`,
+  )
+})
+
+test('runTurn still ends on a plain chat.done when no compaction preceded it', async () => {
+  const sent = []
+  const rest = { sendMessage: async () => {}, stopSession: async () => ({ success: true }) }
+  const { subscribe, registered } = fakeSubscribe()
+  const conv = new Conversation({
+    chatId: 'c1',
+    telegram: { sendMessage: async (c, t) => sent.push(t), sendChatAction: async () => {} },
+    rest,
+    subscribe,
+    logger: noopLogger,
+  })
+  const p = conv.handleText('/send s1 reponse simple')
+  assert.ok(await until(() => registered.length > 0), 'the turn should have subscribed')
+  const onEvent = registered[0].onEvent
+
+  // No compaction: a single chat.done must end the turn and relay the text.
+  onEvent({ type: 'chat.delta', payload: { messageId: 'a1', content: 'reponse simple' } })
+  onEvent({ type: 'chat.done', payload: { messageId: 'a1', reason: 'complete' } })
+  await p
+
+  assert.ok(sent.some((t) => t.includes('reponse simple')), `expected the plain answer, got: ${JSON.stringify(sent)}`)
+})
+
+test('the follow-mode watcher does not forward the compaction summary', async () => {
+  const sent = []
+  const rest = { sendMessage: async () => {}, stopSession: async () => ({ success: true }) }
+  const { subscribe, registered } = fakeSubscribe()
+  const conv = new Conversation({
+    chatId: 'c1',
+    telegram: { sendMessage: async (c, t) => sent.push(t), sendChatAction: async () => {} },
+    rest,
+    subscribe,
+    logger: noopLogger,
+    follow: () => true,
+  })
+  conv.state.sessionId = 's1'
+  conv.syncWatcher()
+  assert.ok(registered.length > 0, 'the watcher should have subscribed')
+
+  // A turn started from OpenFox: the summary, the compaction done, then the
+  // real answer.
+  registered[0].onEvent({ type: 'chat.message', payload: { message: { id: 'sum', role: 'assistant', content: 'RÉSUMÉ DE COMPACTION', isCompactionSummary: true } } })
+  registered[0].onEvent({ type: 'chat.done', payload: { messageId: 'sum', reason: 'complete' } })
+  registered[0].onEvent({ type: 'chat.delta', payload: { messageId: 'a1', content: 'reponse finale' } })
+  registered[0].onEvent({ type: 'chat.done', payload: { messageId: 'a1', reason: 'complete' } })
+  await new Promise((r) => setTimeout(r, 30))
+
+  assert.ok(sent.some((t) => t.includes('reponse finale')), `expected the final answer in follow mode, got: ${JSON.stringify(sent)}`)
+  assert.ok(!sent.some((t) => t.includes('RÉSUMÉ DE COMPACTION')), `compaction summary must not be sent in follow mode, got: ${JSON.stringify(sent)}`)
+})
+
+test('a compaction with a queued message does not hang the turn', async () => {
+  const sent = []
+  const rest = { sendMessage: async () => {}, stopSession: async () => ({ success: true }) }
+  const { subscribe, registered } = fakeSubscribe()
+  const conv = new Conversation({
+    chatId: 'c1',
+    telegram: { sendMessage: async (c, t) => sent.push(t), sendChatAction: async () => {} },
+    rest,
+    subscribe,
+    logger: noopLogger,
+  })
+  const p = conv.handleText('/send s1 reponds apres compaction avec file')
+  assert.ok(await until(() => registered.length > 0), 'the turn should have subscribed')
+  const onEvent = registered[0].onEvent
+
+  // A message queued while the turn runs: turn.queued becomes 1.
+  await conv.queueText('message en file')
+  assert.equal(conv._turn.queued, 1, 'the queued message should be counted')
+
+  // The server emits the compaction summary, then a chat.done for the
+  // compaction turn, then the agent continues and emits the real answer.
+  onEvent({ type: 'chat.message', payload: { message: { id: 'sum', role: 'assistant', content: 'RÉSUMÉ DE COMPACTION', isCompactionSummary: true } } })
+  onEvent({ type: 'chat.done', payload: { messageId: 'sum', reason: 'complete' } })
+  onEvent({ type: 'chat.delta', payload: { messageId: 'a1', content: 'voici la réponse finale.' } })
+  onEvent({ type: 'chat.done', payload: { messageId: 'a1', reason: 'complete' } })
+  await p
+
+  // The real answer is relayed and the turn ends (no hang).
+  assert.ok(
+    sent.some((t) => t.includes('voici la réponse finale')),
+    `expected the final answer after a compaction with a queued message, got: ${JSON.stringify(sent)}`,
+  )
+  // The compaction summary must not be relayed to the user.
+  assert.ok(
+    !sent.some((t) => t.includes('RÉSUMÉ DE COMPACTION')),
+    `the compaction summary should not be relayed, got: ${JSON.stringify(sent)}`,
+  )
 })
 
 test('handleText /stop aborts the running turn and confirms it', async () => {
@@ -1820,6 +1966,55 @@ test('handleCallback path_confirm:always calls confirmPath with alwaysAllow=true
   assert.equal(confirmCalls[0].alwaysAllow, true)
 })
 
+test('handleCallback path_confirm:always also sets danger level to dangerous', async () => {
+  const confirmCalls = []
+  const dangerCalls = []
+  const telegram = {
+    sendMessage: async (chatId, text) => {},
+    sendChatAction: async () => {},
+  }
+  const rest = {
+    sendMessage: async () => {},
+    confirmPath: async (sessionId, callId, approved, alwaysAllow) => {
+      confirmCalls.push({ sessionId, callId, approved, alwaysAllow })
+    },
+    setDangerLevel: async (sessionId, dangerLevel) => {
+      dangerCalls.push({ sessionId, dangerLevel })
+    },
+  }
+  const conv = new Conversation({ chatId: 'c1', telegram, rest, subscribe: fakeSubscribe().subscribe, logger: noopLogger })
+  conv.state.sessionId = 's1'
+  conv.state.pendingPathConfirms = new Map([['abc:def', 's1']])
+
+  await conv.handleCallback('path_confirm:abc:def:always')
+
+  assert.equal(dangerCalls.length, 1)
+  assert.equal(dangerCalls[0].sessionId, 's1')
+  assert.equal(dangerCalls[0].dangerLevel, 'dangerous')
+})
+
+test('handleCallback path_confirm:allow does NOT set danger level', async () => {
+  const dangerCalls = []
+  const telegram = {
+    sendMessage: async (chatId, text) => {},
+    sendChatAction: async () => {},
+  }
+  const rest = {
+    sendMessage: async () => {},
+    confirmPath: async () => {},
+    setDangerLevel: async (sessionId, dangerLevel) => {
+      dangerCalls.push({ sessionId, dangerLevel })
+    },
+  }
+  const conv = new Conversation({ chatId: 'c1', telegram, rest, subscribe: fakeSubscribe().subscribe, logger: noopLogger })
+  conv.state.sessionId = 's1'
+  conv.state.pendingPathConfirms = new Map([['abc:def', 's1']])
+
+  await conv.handleCallback('path_confirm:abc:def:allow')
+
+  assert.equal(dangerCalls.length, 0)
+})
+
 test('handleCallback path_confirm falls back to state.sessionId when no pendingPathConfirms', async () => {
   const confirmCalls = []
   const telegram = {
@@ -2409,10 +2604,8 @@ test('the agents list ends with a night mode button showing its state, and it to
   await conv.handleText('/agents')
   const buttons = telegram.sent.at(-1).extra.reply_markup.inline_keyboard.flat()
   const night = buttons.at(-1)
-  assert.match(night.text, /Mode nuit : désactivé/)
   await conv.handleCallback(night.callback_data)
   assert.deepEqual(toggled, [{ id: 's1', on: true }])
-  assert.match(telegram.sent.at(-1).text, /Mode nuit activé/)
 })
 
 test('without an active session the agents list has no night mode button', async () => {

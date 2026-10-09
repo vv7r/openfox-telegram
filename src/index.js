@@ -116,6 +116,7 @@ const MESSAGES = {
     path_allowed: '✅ Autorisé.',
     path_always_allowed: '✅ Toujours autorisé.',
     path_denied: '❌ Refusé.',
+    path_danger_level_failed: '⚠️ Chemin autorisé, mais le mode dangereux n’a pas pu être activé.',
     history_header: '📜 Historique :',
     history_you: '👤 Vous :',
     history_agent: '🤖 Agent :',
@@ -187,6 +188,7 @@ const MESSAGES = {
     path_allowed: '✅ Allowed.',
     path_always_allowed: '✅ Always allowed.',
     path_denied: '❌ Denied.',
+    path_danger_level_failed: '⚠️ Path confirmed, but danger level could not be set.',
     history_header: '📜 History:',
     history_you: '👤 You:',
     history_agent: '🤖 Agent:',
@@ -202,8 +204,8 @@ function isValidProjectName(name) {
 }
 
 // chat.done reasons that end a turn ("waiting_for_user" does not: the agent
-// waits for an answer; "step_done" belongs to workflows).
-const TURN_END_REASONS = new Set(['complete', 'stopped', 'truncated', 'error'])
+// waits for an answer; "step_done" ends a workflow step).
+const TURN_END_REASONS = new Set(['complete', 'stopped', 'truncated', 'error', 'step_done'])
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
 const noopLogger = { debug() {}, info() {}, warn() {}, error() {} }
@@ -536,6 +538,13 @@ export class OpenFoxRestClient {
     })
   }
 
+  async setDangerLevel(sessionId, dangerLevel) {
+    return this._request(`/api/sessions/${encodeURIComponent(sessionId)}/danger-level`, {
+      method: 'PUT',
+      body: { dangerLevel },
+    })
+  }
+
   async getSessionDetail(sessionId) {
     const data = await this._request(`/api/sessions/${encodeURIComponent(sessionId)}?full=true`)
     return data
@@ -691,6 +700,7 @@ export class Conversation {
     this._locale = null
     // The active project and session survive a plugin or OpenFox restart.
     this.storage = storage ?? null
+    this._savedState = null
     this._restoreState()
   }
 
@@ -874,7 +884,18 @@ export class Conversation {
       }
       enqueue(() => this.sendFormatted(text))
     }
+    const endSegment = (messageId) => {
+      emitText(messageId)
+      const turnChanges = changes
+      changes = new FileChanges()
+      enqueue(() => this.sendTurnEnd('', turnChanges))
+    }
     let finished = false
+    // An auto-compaction emits a `chat.message` (isCompactionSummary) followed by a
+    // `chat.done` ("complete") for the compaction turn, then the agent continues and
+    // emits the real answer. The summary id consumes that compaction done so it does
+    // not end the turn and swallow the real answer.
+    let compactionSummaryId = null
     let resolveDone
     const done = new Promise((resolve) => {
       resolveDone = resolve
@@ -931,6 +952,7 @@ export class Conversation {
         deltas.set(id, (deltas.get(id) ?? '') + msg.payload.content)
       } else if (msg.type === 'chat.message') {
         const m = msg.payload?.message
+        if (m?.isCompactionSummary && !m.subAgentType) compactionSummaryId = m.id
         if (m?.role === 'assistant' && typeof m.content === 'string') {
           fallback.set(m.id ?? 'm', m.content)
         }
@@ -964,18 +986,34 @@ export class Conversation {
         // follows and does not end the turn).
         this._showQuestion(msg.payload, sessionId)
       } else if (msg.type === 'chat.done') {
-        if (msg.payload?.agentType === 'sub-agent') return
-        if (TURN_END_REASONS.has(msg.payload.reason)) {
-          emitText(msg.payload.messageId)
-          const turnChanges = changes
-          changes = new FileChanges()
-          enqueue(() => this.sendTurnEnd('', turnChanges))
-          if (msg.payload.reason === 'complete' && turn.queued > 0) {
-            turn.queued--
-            return
-          }
-          finish()
+        if (msg.payload?.agentType === 'sub-agent') {
+          this.logger.info('telegram: chat.done (sub-agent), no finish', { reason: msg.payload.reason })
+          return
         }
+        if (!TURN_END_REASONS.has(msg.payload.reason)) {
+          this.logger.info('telegram: chat.done (non-terminal reason), no finish', { reason: msg.payload.reason })
+          return
+        }
+        // The compaction turn's own chat.done: the real answer follows, so it
+        // must not send the summary nor end the turn. It still counts as a
+        // queued continuation, so it decrements turn.queued like any done.
+        const isCompactionDone =
+          compactionSummaryId !== null &&
+          msg.payload.reason === 'complete' &&
+          msg.payload.messageId === compactionSummaryId
+        if (isCompactionDone) compactionSummaryId = null
+        if (msg.payload.reason === 'complete' && turn.queued > 0) {
+          turn.queued--
+          if (!isCompactionDone) endSegment(msg.payload.messageId)
+          this.logger.info('telegram: chat.done (queued), no finish', { queued: turn.queued })
+          return
+        }
+        if (isCompactionDone) {
+          this.logger.info('telegram: chat.done (compaction), no finish')
+          return
+        }
+        endSegment(msg.payload.messageId)
+        finish()
       } else if (msg.type === 'chat.error') {
         const error = msg.payload?.error ?? 'error'
         enqueue(() => this.telegram.sendMessage(this.chatId, `⚠️ ${error}`))
@@ -1075,6 +1113,7 @@ export class Conversation {
       changes: new FileChanges(),
       sentIds: new Set(),
       headerSent: false,
+      compactionDonePending: false,
       out: Promise.resolve(),
       close: null,
     }
@@ -1112,6 +1151,7 @@ export class Conversation {
       watcher.deltas.set(p.messageId, (watcher.deltas.get(p.messageId) ?? '') + (p.content ?? ''))
     } else if (msg.type === 'chat.message') {
       const m = p.message
+      if (m?.isCompactionSummary && !m.subAgentType) watcher.compactionDonePending = true
       if (m?.role === 'assistant' && typeof m.content === 'string') watcher.fallback.set(m.id ?? 'm', m.content)
     } else if (msg.type === 'chat.message_updated') {
       if (p.updates?.isStreaming === false) this._emitWatchedText(watcher, p.messageId)
@@ -1125,6 +1165,11 @@ export class Conversation {
       this._showQuestion(p, sessionId)
     } else if (msg.type === 'chat.done') {
       if (p.agentType === 'sub-agent') return
+      // The compaction turn's own chat.done: skip it, the real answer follows.
+      if (watcher.compactionDonePending && p.reason === 'complete') {
+        watcher.compactionDonePending = false
+        return
+      }
       if (!TURN_END_REASONS.has(p.reason)) return
       this._emitWatchedText(watcher, p.messageId)
       const changes = watcher.changes
@@ -1743,6 +1788,15 @@ export class Conversation {
       try {
         const result = await this.rest.confirmPath(sessionId, callId, approved, alwaysAllow)
         this.logger.info('telegram: confirmPath result', { sessionId, callId, approved, alwaysAllow, result })
+        if (alwaysAllow) {
+          try {
+            await this.rest.setDangerLevel(sessionId, 'dangerous')
+            this.logger.info('telegram: setDangerLevel dangerous', { sessionId })
+          } catch (e) {
+            this.logger.error('telegram: setDangerLevel failed', { sessionId, error: e?.message })
+            return this.telegram.sendMessage(this.chatId, this.t('path_danger_level_failed'))
+          }
+        }
         const msg = this.t(alwaysAllow ? 'path_always_allowed' : approved ? 'path_allowed' : 'path_denied')
         return this.telegram.sendMessage(this.chatId, msg)
       } catch (e) {
