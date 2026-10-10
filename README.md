@@ -23,9 +23,9 @@ The keys under the input:
 | ▶️ start | Lists the projects, then their sessions (closes the active session) |
 | ⏹ stop | Stops the agent |
 | 🤖 agents | Switches between builder and planner, toggles night mode |
-| 📊 status | Project, session, agent, night mode, activity, context used |
+| 📊 status | Project, session, agent, model, night mode, activity, context used |
 
-Without an active session, only ▶️ start is shown. Typing `/` lists the commands, in French or English: the four keys, plus `/sessions` (sessions of the project), `/new` (new project) and `/new_session` (new session).
+Without an active session, only ▶️ start is shown. Typing `/` lists the commands, in French or English: the four keys, plus `/model` (switch the session's model: providers by name, 10 models per page, type a word to filter), `/sessions` (sessions of the project), `/new` (new project) and `/new_session` (new session).
 
 A plain message goes to the active session. While the agent works:
 

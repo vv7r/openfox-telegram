@@ -9,6 +9,7 @@ import {
   Conversation,
   register,
   BOT_COMMANDS,
+  BOT_COMMANDS_EN,
   registerBotCommands,
   createRuntime,
   KEYS,
@@ -3952,7 +3953,7 @@ test('the "/" menu is set at start, in French and in English, with the commands 
   assert.ok(!calls.some((c) => c.commands.length === 0), 'never cleared')
   const fr = calls.find((c) => c.lang === null)
   const en = calls.find((c) => c.lang === 'en')
-  const names = ['start', 'stop', 'agents', 'status', 'sessions', 'new', 'new_session']
+  const names = ['start', 'stop', 'agents', 'status', 'model', 'sessions', 'new', 'new_session']
   assert.deepEqual(fr.commands.map((c) => c.command), names)
   assert.deepEqual(en.commands.map((c) => c.command), names)
   for (const c of [...fr.commands, ...en.commands]) assert.match(c.command, /^[a-z0-9_]{1,32}$/)
@@ -4124,59 +4125,138 @@ test('a project name follows OpenFox rules: letters, digits, dot, dash, undersco
 })
 
 // ---------------------------------------------------------------------------
-// Re-import (cache-bust) stops the previous runtime
+// Model picker features
 // ---------------------------------------------------------------------------
 
-test('re-import (cache-bust) stops the previous runtime', async () => {
-  // Fake the network so register() does not hit the real server.
-  const realFetch = globalThis.fetch
-  const realWebSocket = globalThis.WebSocket
-  globalThis.fetch = async () => ({ status: 200, json: async () => ({}) })
-  globalThis.WebSocket = class { constructor() {} close() {} }
-
-  const moduleA = await importFreshModule()
-  const stopped = []
-  const spyStop = () => { stopped.push(1) }
-
-  // Register the first runtime.
-  moduleA.register({
-    registerSettings() {},
-    context: {
-      settings: () => ({ botToken: '123:abc', authorizedUserId: '1', followSession: false, historyCount: 6, historyChars: 500, displayLocale: 'fr' }),
-      storage: { get: () => null, set: () => {} },
-      logger: noopLogger,
+test('OpenFoxRestClient.setSessionProvider POSTs {providerId, model} to /api/sessions/:id/provider', async () => {
+  const calls = []
+  const client = new OpenFoxRestClient({
+    baseUrl: 'http://x',
+    fetchImpl: async (url, opts) => {
+      calls.push([String(url), opts])
+      return { status: 200, json: async () => ({ session: { id: 's1', providerModel: 'm1' } }) }
     },
   })
+  const session = await client.setSessionProvider('s1', 'p1', 'm1')
+  assert.deepEqual(session, { id: 's1', providerModel: 'm1' })
+  const [url, opts] = calls[0]
+  assert.ok(url.endsWith('/api/sessions/s1/provider'))
+  assert.equal(opts.method, 'POST')
+  assert.deepEqual(JSON.parse(opts.body), { providerId: 'p1', model: 'm1' })
+})
 
-  // Wrap stop so it records the call AND actually stops the poll loop.
+test('/status with providerModel shows the model line', async () => {
+  const sent = []
+  const rest = {
+    getSessionDetail: async () => ({ session: { providerModel: 'gpt-4', metadata: { title: 'S1' } } }),
+    listProjects: async () => [{ id: 'p1', name: 'A' }],
+  }
+  const conv = new Conversation({
+    chatId: 'c1',
+    telegram: { sendMessage: async (c, t) => sent.push(t), sendChatAction: async () => {} },
+    rest,
+    subscribe: fakeSubscribe().subscribe,
+    logger: noopLogger,
+  })
+  conv.state.sessionId = 's1'
+  conv.state.projectId = 'p1'
+  await conv.showStatus()
+  assert.ok(sent.at(-1).includes('gpt-4'))
+  assert.ok(sent.at(-1).includes('Modèle'))
+})
+
+test('/model without session says "Pas de session active"', async () => {
+  const sent = []
+  const conv = new Conversation({
+    chatId: 'c1',
+    telegram: { sendMessage: async (c, t) => sent.push(t), sendChatAction: async () => {} },
+    rest: { async getLocale() { return 'fr' } },
+    subscribe: fakeSubscribe().subscribe,
+    logger: noopLogger,
+  })
+  await conv.handleText('/model')
+  assert.ok(sent.at(-1).toLowerCase().includes('session'))
+})
+
+test('/model is in BOT_COMMANDS and not in KEYS', () => {
+  assert.ok(BOT_COMMANDS.some((c) => c.command === 'model'))
+  assert.ok(BOT_COMMANDS_EN.some((c) => c.command === 'model'))
+  assert.ok(!('model' in KEYS))
+})
+
+test('register called twice does not leave orphan runtimes', () => {
+  const r1 = fakeRegistry({ botToken: 'test-token' })
+  register(r1.registry)
+  const r2 = fakeRegistry({ botToken: 'test-token' })
+  register(r2.registry)
+  deactivate()
+  deactivate()
+})
+
+// ---------------------------------------------------------------------------
+// Re-import (cache-bust) stops the previous runtime
+// ---------------------------------------------------------------------------
+//
+// OpenFox re-imports a plugin with a cache-bust query string (?v=...), which
+// creates a FRESH ESM module instance: the module-scoped `runtime` variable is
+// NOT shared across instances. If `register()` only stops the module-scoped
+// `runtime`, the previous runtime (with its poll loop and watchers) is never
+// stopped → orphaned watchers forward every answer multiple times.
+//
+// The fix stores the runtime in globalThis[Symbol.for('openfox-telegram-runtime')]
+// so a re-import can reach and stop the previous runtime.
+
+test('re-import (cache-bust) stops the previous runtime', { timeout: 5000 }, async (t) => {
+  const origFetch = globalThis.fetch
+  const origWebSocket = globalThis.WebSocket
+  const origPort = process.env.OPENFOX_PORT
+  globalThis.fetch = async () => ({ status: 200, json: async () => ({ ok: true, result: [] }) })
+  globalThis.WebSocket = class {
+    constructor(url) { this.url = url; this.readyState = 1 }
+    close() { this.readyState = 3 }
+    send() {}
+    addEventListener() {}
+    removeEventListener() {}
+  }
+  process.env.OPENFOX_PORT = '10370'
+
+  let modA, modB
+  t.after(() => {
+    try { modA?.deactivate() } catch {}
+    try { modB?.deactivate() } catch {}
+    globalThis.fetch = origFetch
+    globalThis.WebSocket = origWebSocket
+    if (origPort === undefined) delete process.env.OPENFOX_PORT
+    else process.env.OPENFOX_PORT = origPort
+  })
+
+  // First "server boot": fresh module instance A.
+  modA = await importFreshModule()
+  modA.register(fakeRegistry({ botToken: 'T1', authorizedUserId: '42' }).registry)
+
+  // The fix stores the runtime in globalThis so a re-import can reach it.
   const runtimeA = globalThis[RUNTIME_KEY]
   assert.ok(runtimeA, 'register should store the runtime in globalThis')
-  const originalStop = runtimeA.stop
-  runtimeA.stop = () => { stopped.push(1); originalStop() }
 
-  // Re-import: a fresh module instance (cache-bust).
-  const moduleB = await importFreshModule()
-  moduleB.register({
-    registerSettings() {},
-    context: {
-      settings: () => ({ botToken: '123:abc', authorizedUserId: '1', followSession: false, historyCount: 6, historyChars: 500, displayLocale: 'fr' }),
-      storage: { get: () => null, set: () => {} },
-      logger: noopLogger,
-    },
-  })
+  // Spy on runtimeA.stop to observe whether the second register stops it.
+  let stopCalled = false
+  const origStop = runtimeA.stop
+  runtimeA.stop = function () {
+    stopCalled = true
+    return origStop.call(this)
+  }
 
-  // The previous runtime's stop must have been called.
-  assert.equal(stopped.length, 1, 'the previous runtime should be stopped on re-import')
+  // Second "server boot" (cache-bust re-import): fresh module instance B.
+  modB = await importFreshModule()
+  modB.register(fakeRegistry({ botToken: 'T1', authorizedUserId: '42' }).registry)
 
-  // The new runtime is stored in globalThis.
+  // The second register must have stopped the first runtime.
+  assert.ok(stopCalled, 'the previous runtime must be stopped on re-import')
+
+  // A fresh runtime is created and stored in globalThis (not the old one).
   const runtimeB = globalThis[RUNTIME_KEY]
-  assert.ok(runtimeB, 'the new runtime should be stored in globalThis')
-  assert.notEqual(runtimeA, runtimeB, 'the new runtime should be a different instance')
-
-  // Cleanup.
-  runtimeB.stop()
-  globalThis.fetch = realFetch
-  globalThis.WebSocket = realWebSocket
+  assert.ok(runtimeB, 'register should store the new runtime in globalThis')
+  assert.notEqual(runtimeB, runtimeA, 'a fresh runtime should be created on re-import')
 })
 
 // ---------------------------------------------------------------------------
@@ -4320,4 +4400,192 @@ test('routine confirmation and turn bookkeeping is logged at debug level, not in
   conv.stopTurn()
   await turn
   assert.deepEqual(infos.filter((m) => /_showPathConfirmation|path_confirm callback|confirmPath result|buttons removed|no finish|removing path confirmation/.test(m)), [])
+})
+
+// ---------------------------------------------------------------------------
+// /model on the real API shape: GET /api/providers returns
+// { providers: [{ id, name, models: [{ id, ... }] }], activeProviderId }.
+// ---------------------------------------------------------------------------
+
+const P_LLAMA = '570e0009-0838-42ff-919a-c037fc25a82f'
+const P_ORCA = '6366b9d5-2ad3-4ec5-b09c-88ae886d0591'
+const P_OPENR = '0fd5f170-a414-4cf1-9694-692ff58f2745'
+const GGUF = 'C:\\ProgramData\\ajean\\models\\Swift-1.5-Qwen3.8-27B-GSQ-RCO-IQ3_XXS-mtp.gguf'
+const OPENR_MODELS = ['anthropic/claude-haiku-5.5', 'anthropic/claude-haiku-5.5:batch', ...Array.from({ length: 28 }, (_, i) => `vendor-${i}/model-${i}-instruct`)]
+
+function providersFixture() {
+  return {
+    providers: [
+      { id: P_LLAMA, name: 'llamacpp', models: [{ id: GGUF, contextWindow: 80000 }] },
+      { id: P_ORCA, name: 'OrcaRouter', models: [{ id: 'orcarouter/free' }, { id: 'orcarouter/fusion' }] },
+      { id: P_OPENR, name: 'OpenRouter', models: OPENR_MODELS.map((id) => ({ id, contextWindow: 128000 })) },
+    ],
+    activeProviderId: P_ORCA,
+  }
+}
+
+function modelConv({ providers = providersFixture(), session = { id: 's1', providerId: P_LLAMA, providerModel: GGUF, metadata: { title: 'Ma session' } }, rest = {} } = {}) {
+  const telegram = progressTelegram()
+  telegram.deleted = []
+  telegram.deleteMessage = async (c, id) => { telegram.deleted.push(id) }
+  const calls = []
+  const conv = new Conversation({
+    chatId: 1,
+    telegram,
+    rest: {
+      async getLocale() { return 'fr' },
+      async listProviders() { return providers },
+      async getSessionDetail(id) { return { session: { ...session, id } } },
+      async setSessionProvider(id, providerId, model) { calls.push({ id, providerId, model }); return { id, providerModel: model, metadata: session.metadata } },
+      async createSession(projectId, title) { calls.push({ create: title, projectId }); return { id: 'new1', title } },
+      async listProjects() { return [{ id: 'p1', name: 'P1' }] },
+      ...rest,
+    },
+    logger: noopLogger,
+    subscribe: fakeSubscribe().subscribe,
+  })
+  conv._locale = 'fr'
+  conv.state.projectId = 'p1'
+  conv.state.sessionId = session ? session.id : null
+  conv.state.stage = 'active'
+  return { conv, telegram, calls }
+}
+
+const keyboardOf = (m) => m.extra?.reply_markup?.inline_keyboard?.flat() ?? []
+const allCallbacksFit = (telegram) => telegram.sent.flatMap(keyboardOf).every((b) => typeof b.text === 'string' && Buffer.byteLength(b.callback_data) <= 64)
+
+test('OpenFoxRestClient.listProviders returns the providers and the active provider id', async () => {
+  const client = new OpenFoxRestClient({ baseUrl: 'http://x', fetchImpl: async () => ({ status: 200, json: async () => providersFixture() }) })
+  const r = await client.listProviders()
+  assert.equal(r.activeProviderId, P_ORCA)
+  assert.equal(r.providers[0].models[0].id, GGUF)
+})
+
+test('/model lists the providers by name, marks the session one, and every button fits Telegram limits', async () => {
+  const { conv, telegram } = modelConv()
+  await conv.handleText('/model')
+  const buttons = keyboardOf(telegram.sent.at(-1))
+  const texts = buttons.map((b) => b.text)
+  assert.ok(texts.some((t) => t.includes('llamacpp') && t.startsWith('✓')), JSON.stringify(texts))
+  assert.ok(texts.some((t) => t.includes('OrcaRouter')))
+  assert.ok(texts.some((t) => t.includes('OpenRouter (30)')), JSON.stringify(texts))
+  assert.ok(!texts.some((t) => t.includes(P_LLAMA)), 'no UUID shown')
+  assert.ok(allCallbacksFit(telegram))
+})
+
+test('choosing a model sets the exact model id (with ":" in it) on the session', async () => {
+  const { conv, telegram, calls } = modelConv()
+  await conv.handleText('/model')
+  const prov = keyboardOf(telegram.sent.at(-1)).find((b) => b.text.includes('OpenRouter'))
+  await conv.handleCallback(prov.callback_data)
+  const batch = keyboardOf(telegram.sent.at(-1)).find((b) => b.text === 'anthropic/claude-haiku-5.5:batch')
+  assert.ok(batch, JSON.stringify(keyboardOf(telegram.sent.at(-1)).map((b) => b.text)))
+  await conv.handleCallback(batch.callback_data)
+  assert.deepEqual(calls, [{ id: 's1', providerId: P_OPENR, model: 'anthropic/claude-haiku-5.5:batch' }])
+  assert.match(telegram.sent.at(-1).text, /anthropic\/claude-haiku-5\.5:batch/)
+  assert.match(telegram.sent.at(-1).text, /Ma session/)
+  assert.ok(allCallbacksFit(telegram))
+})
+
+test('a local model path is shown by its file name and set with its full id', async () => {
+  const { conv, telegram, calls } = modelConv({ session: { id: 's1', providerId: P_ORCA, providerModel: 'orcarouter/free' } })
+  await conv.handleText('/model')
+  await conv.handleCallback(keyboardOf(telegram.sent.at(-1)).find((b) => b.text.includes('llamacpp')).callback_data)
+  const btn = keyboardOf(telegram.sent.at(-1)).find((b) => b.text.includes('.gguf'))
+  assert.equal(btn.text, 'Swift-1.5-Qwen3.8-27B-GSQ-RCO-IQ3_XXS-mtp.gguf')
+  assert.match(telegram.sent.at(-1).text, /· 1 modèle$/m)
+  await conv.handleCallback(btn.callback_data)
+  assert.equal(calls[0].model, GGUF)
+})
+
+test('the current model is marked in its list', async () => {
+  const { conv, telegram } = modelConv({ session: { id: 's1', providerId: P_ORCA, providerModel: 'orcarouter/fusion' } })
+  await conv.handleText('/model')
+  await conv.handleCallback(keyboardOf(telegram.sent.at(-1)).find((b) => b.text.includes('OrcaRouter')).callback_data)
+  const texts = keyboardOf(telegram.sent.at(-1)).map((b) => b.text)
+  assert.ok(texts.includes('✓ orcarouter/fusion'), JSON.stringify(texts))
+  assert.ok(texts.includes('orcarouter/free'))
+})
+
+test('long model lists are paged, and typing a word filters them', async () => {
+  const { conv, telegram, calls } = modelConv()
+  await conv.handleText('/model')
+  await conv.handleCallback(keyboardOf(telegram.sent.at(-1)).find((b) => b.text.includes('OpenRouter')).callback_data)
+  const page1 = keyboardOf(telegram.sent.at(-1))
+  assert.ok(page1.filter((b) => b.callback_data.startsWith('mdl:')).length <= 10)
+  const next = page1.find((b) => b.text === '▶️')
+  assert.ok(next, 'a next-page button')
+  await conv.handleCallback(next.callback_data)
+  assert.match(telegram.sent.at(-1).text, /2\/3/)
+  // Typed text while the list is open filters the models (it is not sent to the agent).
+  await conv.handleText('batch')
+  const filtered = keyboardOf(telegram.sent.at(-1)).filter((b) => b.callback_data.startsWith('mdl:'))
+  assert.deepEqual(filtered.map((b) => b.text), ['anthropic/claude-haiku-5.5:batch'])
+  await conv.handleCallback(filtered[0].callback_data)
+  assert.equal(calls[0].model, 'anthropic/claude-haiku-5.5:batch')
+  assert.ok(allCallbacksFit(telegram))
+})
+
+test('a list that was replaced or closed cannot change a model any more', async () => {
+  const { conv, telegram, calls } = modelConv()
+  await conv.handleText('/model')
+  await conv.handleCallback(keyboardOf(telegram.sent.at(-1)).find((b) => b.text.includes('OrcaRouter')).callback_data)
+  const stale = keyboardOf(telegram.sent.at(-1)).find((b) => b.text === 'orcarouter/free')
+  await conv.handleText('/model') // a new list replaces the old one
+  await conv.handleCallback(stale.callback_data)
+  assert.deepEqual(calls, [])
+  assert.match(telegram.sent.at(-1).text, /expiré/)
+})
+
+test('creating a session asks for a model, also with /new_session <title>; "default" creates without one', async () => {
+  for (const start of [['/new_session Démo'], ['/new_session', 'Démo']]) {
+    const { conv, telegram, calls } = modelConv()
+    for (const t of start) await conv.handleText(t)
+    const buttons = keyboardOf(telegram.sent.at(-1))
+    assert.ok(buttons.some((b) => b.text.includes('OpenRouter')), `${start}: ${JSON.stringify(buttons.map((b) => b.text))}`)
+    const def = buttons.find((b) => b.callback_data.startsWith('mdf:'))
+    await conv.handleCallback(def.callback_data)
+    assert.deepEqual(calls, [{ create: 'Démo', projectId: 'p1' }])
+    assert.equal(conv.state.sessionId, 'new1')
+  }
+})
+
+test('creating a session with a chosen model sets it on the new session', async () => {
+  const { conv, telegram, calls } = modelConv()
+  await conv.handleText('/new_session Démo')
+  await conv.handleCallback(keyboardOf(telegram.sent.at(-1)).find((b) => b.text.includes('OrcaRouter')).callback_data)
+  await conv.handleCallback(keyboardOf(telegram.sent.at(-1)).find((b) => b.text === 'orcarouter/fusion').callback_data)
+  assert.deepEqual(calls, [{ create: 'Démo', projectId: 'p1' }, { id: 'new1', providerId: P_ORCA, model: 'orcarouter/fusion' }])
+  assert.equal(conv.state.sessionId, 'new1')
+})
+
+test('cancelling a creation closes its list: a late click changes nothing', async () => {
+  const { conv, telegram, calls } = modelConv()
+  await conv.handleText('/new_session Démo')
+  await conv.handleCallback(keyboardOf(telegram.sent.at(-1)).find((b) => b.text.includes('OrcaRouter')).callback_data)
+  const late = keyboardOf(telegram.sent.at(-1)).find((b) => b.text === 'orcarouter/free')
+  const cancel = keyboardOf(telegram.sent.at(-1)).find((b) => b.callback_data.startsWith('mcx:'))
+  await conv.handleCallback(cancel.callback_data)
+  assert.match(telegram.sent.at(-1).text, /annulée/)
+  await conv.handleCallback(late.callback_data)
+  assert.deepEqual(calls, [], 'neither a creation nor a model change on the previous session')
+  assert.equal(conv.state.sessionId, 's1')
+})
+
+test('an open model list does not swallow messages for ever', async () => {
+  const sentToAgent = []
+  const { conv } = modelConv({ rest: { async sendMessage(id, content) { sentToAgent.push(content); return {} } } })
+  await conv.handleText('/model')
+  conv._picker.shownAt -= 11 * 60 * 1000 // older than the list lifetime
+  const turn = conv.handleText('fais le point')
+  await sleep(10)
+  assert.deepEqual(sentToAgent, ['fais le point'])
+  conv.stopTurn()
+  await turn
+})
+
+test('/status shows the default model when the session has none of its own', async () => {
+  const { conv, telegram } = modelConv({ session: { id: 's1', providerId: null, providerModel: null } })
+  await conv.handleText('/status')
+  assert.match(telegram.sent.at(-1).text, /Modèle : modèle par défaut/)
 })

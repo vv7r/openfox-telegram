@@ -44,6 +44,7 @@ export const BOT_COMMANDS = [
   { command: 'stop', description: "Arrêter l'agent" },
   { command: 'agents', description: "Changer d'agent, mode nuit" },
   { command: 'status', description: 'État de la session' },
+  { command: 'model', description: 'Changer de modèle' },
   { command: 'sessions', description: 'Sessions du projet' },
   { command: 'new', description: 'Nouveau projet' },
   { command: 'new_session', description: 'Nouvelle session' },
@@ -53,6 +54,7 @@ export const BOT_COMMANDS_EN = [
   { command: 'stop', description: 'Stop the agent' },
   { command: 'agents', description: 'Switch agent, night mode' },
   { command: 'status', description: 'Session status' },
+  { command: 'model', description: 'Switch model' },
   { command: 'sessions', description: 'Sessions of the project' },
   { command: 'new', description: 'New project' },
   { command: 'new_session', description: 'New session' },
@@ -69,7 +71,7 @@ const MESSAGES = {
     night_on: "🌙 Mode nuit activé : l'agent agit sans demander d'autorisation.",
     night_off: '☀️ Mode nuit désactivé : l\'agent demande les autorisations.',
     night_active_note: "🌙 Mode nuit actif : l'agent agit sans demander d'autorisation.",
-    status: '📁 Projet : {project}\n💬 Session : {session}\n🤖 Agent : {mode}\n🌙 Mode nuit : {night}\n⏳ Agent : {activity}\n🧠 Contexte : {context}',
+    status: '📁 Projet : {project}\n💬 Session : {session}\n🤖 Agent : {mode}\n🔤 Modèle : {model}\n🌙 Mode nuit : {night}\n⏳ Agent : {activity}\n🧠 Contexte : {context}',
     status_running: 'en cours',
     status_idle: 'au repos',
     answer_sent: '✅ Réponse envoyée.',
@@ -133,6 +135,25 @@ const MESSAGES = {
     history_agent: '🤖 Agent :',
     night_unreadable: "⚠️ Impossible de lire le mode nuit de la session, réessayez.",
     invalid_project_name: 'Nom de projet invalide : lettres sans accents, chiffres, points, tirets, soulignés et espaces seulement.',
+    model_choose: 'Choisis un modèle :',
+    model_set: 'Modèle défini sur "{model}" pour la session « {title} ».',
+    model_default: 'modèle par défaut',
+    provider_choose: 'Choisis un fournisseur :',
+    model_for_new_session: 'Nouvelle session « {title} » : choisis un modèle, ou garde le modèle par défaut.',
+    model_default_btn: '⏭️ Modèle par défaut',
+    model_cancel_btn: '✖️ Annuler',
+    model_close_btn: '✖️ Fermer',
+    model_back_btn: '↩️ Fournisseurs',
+    model_page: 'Page {page}/{pages} · {count} modèles',
+    model_page_one: 'Page {page}/{pages} · 1 modèle',
+    model_filter_hint: '🔎 Tape une partie du nom pour filtrer.',
+    model_filter_active: '🔎 Filtre : « {filter} »',
+    model_no_match: 'Aucun modèle ne contient « {filter} ».',
+    model_closed: 'Choix du modèle fermé.',
+    choice_expired: '⚠️ Ce choix a expiré : relance /model.',
+    no_models: 'Aucun modèle disponible.',
+    creation_cancelled: 'Création annulée.',
+    model_set_failed: '⚠️ Le modèle n’a pas pu être défini : {err}',
   },
   en: {
     nothing_to_stop: 'Nothing to stop right now.',
@@ -144,7 +165,7 @@ const MESSAGES = {
     night_on: '🌙 Night mode on: the agent acts without asking for permission.',
     night_off: '☀️ Night mode off: the agent asks for permission.',
     night_active_note: '🌙 Night mode on: the agent acts without asking for permission.',
-    status: '📁 Project: {project}\n💬 Session: {session}\n🤖 Agent: {mode}\n🌙 Night mode: {night}\n⏳ Agent: {activity}\n🧠 Context: {context}',
+    status: '📁 Project: {project}\n💬 Session: {session}\n🤖 Agent: {mode}\n🔤 Model: {model}\n🌙 Night mode: {night}\n⏳ Agent: {activity}\n🧠 Context: {context}',
     status_running: 'working',
     status_idle: 'idle',
     answer_sent: '✅ Answer sent.',
@@ -208,6 +229,25 @@ const MESSAGES = {
     history_agent: '🤖 Agent:',
     night_unreadable: "⚠️ Could not read the session's night mode, try again.",
     invalid_project_name: 'Invalid project name: letters without accents, digits, dots, dashes, underscores and spaces only.',
+    model_choose: 'Pick a model:',
+    model_set: 'Model set to "{model}" for session "{title}".',
+    model_default: 'default model',
+    provider_choose: 'Pick a provider:',
+    model_for_new_session: 'New session "{title}": pick a model, or keep the default one.',
+    model_default_btn: '⏭️ Default model',
+    model_cancel_btn: '✖️ Cancel',
+    model_close_btn: '✖️ Close',
+    model_back_btn: '↩️ Providers',
+    model_page: 'Page {page}/{pages} · {count} models',
+    model_page_one: 'Page {page}/{pages} · 1 model',
+    model_filter_hint: '🔎 Type part of a name to filter.',
+    model_filter_active: '🔎 Filter: "{filter}"',
+    model_no_match: 'No model contains "{filter}".',
+    model_closed: 'Model choice closed.',
+    choice_expired: '⚠️ This choice has expired: run /model again.',
+    no_models: 'No models available.',
+    creation_cancelled: 'Creation cancelled.',
+    model_set_failed: '⚠️ The model could not be set: {err}',
   },
 }
 
@@ -266,7 +306,18 @@ export const KEYS = { start: '▶️ start', stop: '⏹ stop', agents: '🤖 age
 // Buttons of the projects, sessions and agents lists (not of a question or a confirmation).
 function isListChoice(data) {
   const d = String(data)
-  return /^(proj|sess|agent):/.test(d) || ['new_proj', 'new_sess', 'reset', 'night:toggle'].includes(d)
+  return /^(proj|sess|agent|prv|mdl|mpg|mpb|mdf|mcx):/.test(d) || ['new_proj', 'new_sess', 'reset', 'night:toggle'].includes(d)
+}
+
+// Model lists: models per page, and how long an open list captures typed
+// text (as a filter) before typed text goes to the agent again.
+const MODEL_PAGE_SIZE = 10
+const MODEL_PICKER_TTL_MS = 10 * 60 * 1000
+
+// A model id as shown on a button: a local file path by its file name
+// ("C:\\…\\model.gguf" -> "model.gguf"), any other id as is.
+function modelLabel(id) {
+  return id.includes('\\') || id.startsWith('/') ? id.split(/[\\/]/).pop() : id
 }
 
 // Agents offered by the agents key, in this order.
@@ -308,7 +359,8 @@ function isCommand(t) {
     t.startsWith('/send ') ||
     t.startsWith('/continue ') ||
     t === '/agents' ||
-    t === '/status'
+    t === '/status' ||
+    t === '/model'
   )
 }
 
@@ -571,6 +623,19 @@ export class OpenFoxRestClient {
   async getSessionDetail(sessionId) {
     const data = await this._request(`/api/sessions/${encodeURIComponent(sessionId)}?full=true`)
     return data
+  }
+
+  /** The providers, each with its models ({ id, ... }), and the active provider id. */
+  async listProviders() {
+    const data = await this._request('/api/providers')
+    return { providers: data.providers ?? [], activeProviderId: data.activeProviderId ?? null }
+  }
+
+  async setSessionProvider(sessionId, providerId, model) {
+    return (await this._request(`/api/sessions/${encodeURIComponent(sessionId)}/provider`, {
+      method: 'POST',
+      body: { providerId, model },
+    })).session
   }
 }
 
@@ -1325,6 +1390,7 @@ export class Conversation {
         project,
         session: session.metadata?.title ?? session.title ?? this.state.sessionId,
         mode: session.mode ?? '—',
+        model: session.providerModel ? modelLabel(session.providerModel) : this.t('model_default'),
         night: this.t(session.nightMode ? 'night_enabled' : 'night_disabled'),
         activity: this.t(session.isRunning ? 'status_running' : 'status_idle'),
         context,
@@ -1458,6 +1524,16 @@ export class Conversation {
     if (this.state.stage === 'new_session_title' && !isCommand(t)) {
       return this.confirmNewSession(t)
     }
+    // An open model list: typed text filters its models. A command closes
+    // it; on a provider list, typed text closes it (and cancels a creation).
+    const picker = this._livePicker()
+    if (picker && isCommand(t)) {
+      this._closePicker()
+    } else if (picker) {
+      if (picker.providerIndex !== null) return this._filterModels(picker, t)
+      this._closePicker()
+      if (picker.purpose === 'create') return this.telegram.sendMessage(this.chatId, this.t('creation_cancelled'))
+    }
 
     if (t === '/start' || t === '/reset') return this.showProjects()
     if (t === '/stop') {
@@ -1513,6 +1589,12 @@ export class Conversation {
     }
     if (t === '/agents') return this.showAgents()
     if (t === '/status') return this.showStatus()
+    if (t === '/model') {
+      if (!this.state.sessionId) {
+        return this.telegram.sendMessage(this.chatId, this.t('no_active_session'), { reply_markup: menuKeyboard({ session: false }) })
+      }
+      return this.showModels()
+    }
 
     if (/^\d+$/.test(t)) return this.select(t)
     return this.forwardText(t)
@@ -1709,11 +1791,39 @@ export class Conversation {
       this.state.stage = 'new_session_title'
       return this.telegram.sendMessage(this.chatId, this.t('send_session_title'))
     }
+    // The model of the new session is chosen first (or the default one kept).
+    const picker = this._openPicker({ purpose: 'create', title, projectId: this.state.projectId })
+    let providers = []
     try {
-      const session = await this.rest.createSession(this.state.projectId, title)
+      providers = await this._loadProviders(picker)
+    } catch (e) {
+      this.logger.warn('telegram: providers unavailable, session created with the default model', { error: e?.message })
+    }
+    if (providers.length === 0) {
+      this._closePicker()
+      return this._createSession(title, null, picker.projectId)
+    }
+    return this._showProviderList(picker)
+  }
+
+  /** Create the session, then set its model when one was chosen. */
+  async _createSession(title, choice, projectId = this.state.projectId) {
+    if (!projectId || !title) return this.telegram.sendMessage(this.chatId, this.t('pick_project_first'))
+    try {
+      const session = await this.rest.createSession(projectId, title)
+      this.state.projectId = projectId
       this.state.sessionId = session.id
       this.state.stage = 'active'
-      return this.telegram.sendMessage(this.chatId, this.t('session_created', { title: session.title ?? title, id: session.id }), {
+      let warning = ''
+      if (choice) {
+        try {
+          await this.rest.setSessionProvider(session.id, choice.providerId, choice.modelId)
+        } catch (e) {
+          this.logger.warn('telegram: setSessionProvider after create failed', { error: e?.message })
+          warning = `\n\n${this.t('model_set_failed', { err: e?.message ?? 'error' })}`
+        }
+      }
+      return this.telegram.sendMessage(this.chatId, this.t('session_created', { title: session.title ?? title, id: session.id }) + warning, {
         reply_markup: menuKeyboard(),
       })
     } catch (e) {
@@ -1782,6 +1892,178 @@ export class Conversation {
     }
   }
 
+  // --- model lists (/model, and the model of a new session) ---
+  // Buttons carry the list's generation and an index, never an id (ids can
+  // be long, contain ":" and exceed Telegram's 64-byte callback data). A new
+  // list replaces the previous one: buttons of an older list expire.
+
+  _openPicker(fields) {
+    this._pickerSeq = (this._pickerSeq ?? 0) + 1
+    this._picker = { gen: this._pickerSeq, filter: '', page: 0, providerIndex: null, messageId: null, shownAt: Date.now(), ...fields }
+    return this._picker
+  }
+
+  _closePicker() {
+    this._picker = null
+  }
+
+  /** The open list, while it is recent enough to take typed text as a filter. */
+  _livePicker() {
+    const p = this._picker
+    if (p && Date.now() - p.shownAt > MODEL_PICKER_TTL_MS) this._picker = null
+    return this._picker
+  }
+
+  async _loadProviders(picker) {
+    const { providers = [], activeProviderId = null } = (await this.rest.listProviders()) ?? {}
+    picker.activeProviderId = activeProviderId
+    picker.providers = providers
+      .map((p) => ({
+        id: p.id,
+        name: p.name ?? p.id,
+        models: (p.models ?? []).map((m) => (typeof m === 'string' ? m : m?.id)).filter(Boolean),
+      }))
+      .filter((p) => p.models.length > 0)
+    return picker.providers
+  }
+
+  /** Show the list in place of the previous one. */
+  async _sendPicker(picker, text, rows) {
+    const old = picker.messageId
+    picker.messageId = null
+    if (old != null) {
+      try {
+        await this.telegram.deleteMessage?.(this.chatId, old)
+      } catch {}
+    }
+    picker.shownAt = Date.now()
+    const sent = await this.telegram.sendMessage(this.chatId, text, { reply_markup: { inline_keyboard: rows } })
+    picker.messageId = sent?.message_id ?? null
+    return sent
+  }
+
+  _pickerFooter(picker) {
+    const rows = []
+    if (picker.purpose === 'create') rows.push([{ text: this.t('model_default_btn'), callback_data: `mdf:${picker.gen}` }])
+    rows.push([{ text: this.t(picker.purpose === 'create' ? 'model_cancel_btn' : 'model_close_btn'), callback_data: `mcx:${picker.gen}` }])
+    return rows
+  }
+
+  async _showProviderList(picker) {
+    if (picker.providers.length === 1) {
+      picker.providerIndex = 0
+      return this._showModelPage(picker)
+    }
+    const rows = picker.providers.map((p, i) => [
+      { text: `${p.id === picker.currentProviderId ? '✓ ' : ''}${p.name} (${p.models.length})`, callback_data: `prv:${picker.gen}:${i}` },
+    ])
+    const text = picker.purpose === 'create' ? this.t('model_for_new_session', { title: picker.title }) : this.t('provider_choose')
+    return this._sendPicker(picker, text, [...rows, ...this._pickerFooter(picker)])
+  }
+
+  async _showModelPage(picker) {
+    const provider = picker.providers[picker.providerIndex]
+    const filter = picker.filter.toLowerCase()
+    picker.visible = filter ? provider.models.filter((id) => id.toLowerCase().includes(filter)) : provider.models
+    const pages = Math.max(1, Math.ceil(picker.visible.length / MODEL_PAGE_SIZE))
+    picker.page = Math.min(Math.max(0, picker.page), pages - 1)
+    const start = picker.page * MODEL_PAGE_SIZE
+    const rows = picker.visible.slice(start, start + MODEL_PAGE_SIZE).map((id, j) => {
+      const current = provider.id === picker.currentProviderId && id === picker.currentModel
+      return [{ text: `${current ? '✓ ' : ''}${modelLabel(id)}`, callback_data: `mdl:${picker.gen}:${start + j}` }]
+    })
+    if (pages > 1) {
+      const nav = []
+      if (picker.page > 0) nav.push({ text: '◀️', callback_data: `mpg:${picker.gen}:${picker.page - 1}` })
+      if (picker.page < pages - 1) nav.push({ text: '▶️', callback_data: `mpg:${picker.gen}:${picker.page + 1}` })
+      rows.push(nav)
+    }
+    if (picker.providers.length > 1) rows.push([{ text: this.t('model_back_btn'), callback_data: `mpb:${picker.gen}` }])
+    const lines = [`${provider.name} · ${this.t('model_choose')}`]
+    lines.push(
+      picker.visible.length === 0
+        ? this.t('model_no_match', { filter: picker.filter })
+        : this.t(picker.visible.length === 1 ? 'model_page_one' : 'model_page', { page: picker.page + 1, pages, count: picker.visible.length }),
+    )
+    lines.push(picker.filter ? this.t('model_filter_active', { filter: picker.filter }) : this.t('model_filter_hint'))
+    return this._sendPicker(picker, lines.join('\n'), [...rows, ...this._pickerFooter(picker)])
+  }
+
+  _filterModels(picker, text) {
+    picker.filter = text.trim()
+    picker.page = 0
+    return this._showModelPage(picker)
+  }
+
+  /** /model: the providers of OpenFox, then the models of the one chosen. */
+  async showModels() {
+    const sessionId = this.state.sessionId
+    let session = null
+    try {
+      session = (await this.rest.getSessionDetail(sessionId))?.session ?? null
+    } catch {}
+    const picker = this._openPicker({
+      purpose: 'set',
+      sessionId,
+      currentProviderId: session?.providerId ?? null,
+      currentModel: session?.providerModel ?? null,
+    })
+    const providers = await this._loadProviders(picker)
+    if (providers.length === 0) {
+      this._closePicker()
+      return this.telegram.sendMessage(this.chatId, this.t('no_models'))
+    }
+    return this._showProviderList(picker)
+  }
+
+  async _applyModel(sessionId, providerId, modelId) {
+    try {
+      const session = await this.rest.setSessionProvider(sessionId, providerId, modelId)
+      return this.telegram.sendMessage(
+        this.chatId,
+        this.t('model_set', { model: modelLabel(modelId), title: session?.metadata?.title ?? session?.title ?? sessionId }),
+      )
+    } catch (e) {
+      return this.telegram.sendMessage(this.chatId, this.t('model_set_failed', { err: e?.message ?? 'error' }))
+    }
+  }
+
+  /** A click in a model list: prv/mpg/mpb navigate, mdl picks, mdf keeps the default, mcx closes. */
+  async _onPickerCallback(data) {
+    const [kind, gen, arg] = data.split(':')
+    const picker = this._picker
+    if (!picker || String(picker.gen) !== gen) return this.telegram.sendMessage(this.chatId, this.t('choice_expired'))
+    // The clicked list is deleted by the runtime.
+    picker.messageId = null
+    if (kind === 'prv') {
+      if (!picker.providers[Number(arg)]) return this.telegram.sendMessage(this.chatId, this.t('choice_expired'))
+      Object.assign(picker, { providerIndex: Number(arg), page: 0, filter: '' })
+      return this._showModelPage(picker)
+    }
+    if (kind === 'mpg') {
+      picker.page = Number(arg)
+      return this._showModelPage(picker)
+    }
+    if (kind === 'mpb') {
+      Object.assign(picker, { providerIndex: null, page: 0, filter: '' })
+      return this._showProviderList(picker)
+    }
+    if (kind === 'mdl') {
+      const provider = picker.providers[picker.providerIndex]
+      const modelId = picker.visible?.[Number(arg)]
+      if (!provider || !modelId) return this.telegram.sendMessage(this.chatId, this.t('choice_expired'))
+      this._closePicker()
+      if (picker.purpose === 'create') return this._createSession(picker.title, { providerId: provider.id, modelId }, picker.projectId)
+      return this._applyModel(picker.sessionId, provider.id, modelId)
+    }
+    if (kind === 'mdf' && picker.purpose === 'create') {
+      this._closePicker()
+      return this._createSession(picker.title, null, picker.projectId)
+    }
+    this._closePicker()
+    return this.telegram.sendMessage(this.chatId, this.t(picker.purpose === 'create' ? 'creation_cancelled' : 'model_closed'))
+  }
+
   async handleCallback(data) {
     try {
       return await this._handleCallback(data)
@@ -1837,6 +2119,7 @@ export class Conversation {
         return this.telegram.sendMessage(this.chatId, `⚠️ ${e?.message ?? 'error'}`)
       }
     }
+    if (/^(prv|mdl|mpg|mpb|mdf|mcx):/.test(data)) return this._onPickerCallback(data)
     if (data.startsWith('ask:')) {
       // ask:<token>:<choice>
       const [, token, choice] = data.split(':')
