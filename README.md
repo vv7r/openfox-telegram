@@ -31,7 +31,7 @@ A plain message goes to the active session. While the agent works:
 
 - one progress message lists the tools it runs, long commands folded in an expandable quote;
 - a message you send goes to OpenFox's queue at once, as in the web UI;
-- questions come with buttons (or answer by message), permission requests with Allow / Deny / Always allow.
+- questions come with buttons (or answer by message), permission requests with Allow / Deny / Allow everything (as in the web UI, it switches the session to dangerous mode; it is not offered for `git --no-verify`).
 
 At the end of a turn:
 

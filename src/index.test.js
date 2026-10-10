@@ -771,6 +771,8 @@ test('a compaction with a queued message does not hang the turn', async () => {
   // compaction turn, then the agent continues and emits the real answer.
   onEvent({ type: 'chat.message', payload: { message: { id: 'sum', role: 'assistant', content: 'RÉSUMÉ DE COMPACTION', isCompactionSummary: true } } })
   onEvent({ type: 'chat.done', payload: { messageId: 'sum', reason: 'complete' } })
+  // The server then injects the queued message (its own chat.done).
+  onEvent({ type: 'chat.done', payload: { messageId: 'asap1', reason: 'complete' } })
   onEvent({ type: 'chat.delta', payload: { messageId: 'a1', content: 'voici la réponse finale.' } })
   onEvent({ type: 'chat.done', payload: { messageId: 'a1', reason: 'complete' } })
   await p
@@ -1904,7 +1906,7 @@ test('runTurn sends path confirmation with buttons', async () => {
   assert.equal(rows[0][0].callback_data, 'path_confirm:pc:1:2:allow')
   assert.equal(rows[0][1].text, 'Refuser')
   assert.equal(rows[0][1].callback_data, 'path_confirm:pc:1:2:deny')
-  assert.equal(rows[1][0].text, 'Toujours autoriser')
+  assert.equal(rows[1][0].text, 'Tout autoriser')
   assert.equal(rows[1][0].callback_data, 'path_confirm:pc:1:2:always')
 })
 
@@ -1957,18 +1959,17 @@ test('handleCallback path_confirm:deny calls confirmPath with approved=false', a
   assert.equal(confirmCalls[0].approved, false)
 })
 
-test('handleCallback path_confirm:always calls confirmPath with alwaysAllow=true', async () => {
-  const confirmCalls = []
+test('handleCallback path_confirm:always switches the session to dangerous mode (no confirmPath needed)', async () => {
+  const calls = []
   const telegram = {
-    sendMessage: async (chatId, text) => {},
+    sendMessage: async () => {},
     sendChatAction: async () => {},
     editMessageReplyMarkup: async () => {},
   }
   const rest = {
     sendMessage: async () => {},
-    confirmPath: async (sessionId, callId, approved, alwaysAllow) => {
-      confirmCalls.push({ sessionId, callId, approved, alwaysAllow })
-    },
+    confirmPath: async (...a) => { calls.push(['confirmPath', ...a]) },
+    setDangerLevel: async (...a) => { calls.push(['setDangerLevel', ...a]) },
   }
   const conv = new Conversation({ chatId: 'c1', telegram, rest, subscribe: fakeSubscribe().subscribe, logger: noopLogger })
   conv.state.sessionId = 's1'
@@ -1976,9 +1977,7 @@ test('handleCallback path_confirm:always calls confirmPath with alwaysAllow=true
 
   await conv.handleCallback('path_confirm:abc:def:always')
 
-  assert.equal(confirmCalls.length, 1)
-  assert.equal(confirmCalls[0].approved, true)
-  assert.equal(confirmCalls[0].alwaysAllow, true)
+  assert.deepEqual(calls, [['setDangerLevel', 's1', 'dangerous']])
 })
 
 test('handleCallback path_confirm:always also sets danger level to dangerous', async () => {
@@ -4049,7 +4048,7 @@ test('English: permission request, its results, the turn timeout and the history
   registered[0].onEvent({ type: 'chat.path_confirmation', payload: { callId: 'p1', tool: 'run_command', paths: ['/etc'], reason: 'dangerous_command' } })
   const confirm = telegram.sent.at(-1)
   assert.match(confirm.text, /dangerous command/)
-  assert.deepEqual(confirm.extra.reply_markup.inline_keyboard.flat().map((b) => b.text), ['Allow', 'Deny', 'Always allow'])
+  assert.deepEqual(confirm.extra.reply_markup.inline_keyboard.flat().map((b) => b.text), ['Allow', 'Deny', 'Allow everything'])
   await conv.handleCallback('path_confirm:p1:allow')
   assert.equal(telegram.sent.at(-1).text, '✅ Allowed.')
   conv.stopTurn()
@@ -4178,4 +4177,147 @@ test('re-import (cache-bust) stops the previous runtime', async () => {
   runtimeB.stop()
   globalThis.fetch = realFetch
   globalThis.WebSocket = realWebSocket
+})
+
+// ---------------------------------------------------------------------------
+// Review of v1.0.3: compaction + queue, permission wording and buttons,
+// double button removal, log levels.
+// ---------------------------------------------------------------------------
+
+function confirmConv({ locale = 'fr', rest = {}, telegram } = {}) {
+  const tg = telegram ?? progressTelegram()
+  const { subscribe, registered } = fakeSubscribe()
+  const conv = new Conversation({
+    chatId: 1,
+    telegram: tg,
+    rest: { async getLocale() { return locale }, async sendMessage() { return {} }, ...rest },
+    logger: noopLogger,
+    subscribe,
+  })
+  return { conv, telegram: tg, registered }
+}
+
+test('compaction then a queued message: the turn lasts until the answer to that message', async () => {
+  const { conv, telegram, registered } = confirmConv()
+  const turn = conv.handleText('/send s1 go')
+  await sleep(5)
+  await conv.queueText('message en file')
+  const ev = registered[0].onEvent
+  // Compaction first (its own chat.done), then the server injects the queued
+  // message (a chat.done for it), then the agent answers it.
+  ev({ type: 'chat.message', payload: { message: { id: 'sum', role: 'assistant', content: 'RÉSUMÉ', isCompactionSummary: true } } })
+  ev({ type: 'chat.done', payload: { messageId: 'sum', reason: 'complete' } })
+  ev({ type: 'chat.done', payload: { messageId: 'asap1', reason: 'complete' } })
+  const endedEarly = await Promise.race([turn.then(() => true), sleep(60).then(() => false)])
+  assert.equal(endedEarly, false, 'the turn must still be waiting for the answer to the queued message')
+  ev({ type: 'chat.delta', payload: { messageId: 'a1', content: 'Réponse au message en file.' } })
+  ev({ type: 'chat.message_updated', payload: { messageId: 'a1', updates: { isStreaming: false } } })
+  ev({ type: 'chat.done', payload: { messageId: 'a1', reason: 'complete' } })
+  await turn
+  const texts = telegram.sent.map((m) => m.text)
+  assert.ok(texts.includes('Réponse au message en file.'), JSON.stringify(texts))
+  assert.ok(!texts.some((t) => t.includes('RÉSUMÉ')))
+})
+
+test('permission requests say what is asked, like the web UI', async () => {
+  const cases = [
+    ['fr', 'outside_workdir', 'accès hors dossier'],
+    ['fr', 'sensitive_file', 'fichier sensible'],
+    ['fr', 'both', 'fichier sensible hors du projet'],
+    ['fr', 'dangerous_command', 'commande dangereuse'],
+    ['fr', 'git_no_verify', 'git --no-verify'],
+    ['en', 'sensitive_file', 'sensitive file'],
+    ['en', 'both', 'sensitive file outside the project'],
+    ['en', 'git_no_verify', 'git --no-verify'],
+  ]
+  for (const [locale, reason, expected] of cases) {
+    const { conv, telegram, registered } = confirmConv({ locale })
+    await conv._ensureLocale()
+    const turn = conv.runTurn('s1', 'go')
+    registered[0].onEvent({ type: 'chat.path_confirmation', payload: { callId: 'p1', tool: 'run_command', paths: ['/x'], reason } })
+    await sleep(5)
+    const sent = telegram.sent.find((m) => m.text.includes('🔒'))
+    assert.ok(sent.text.includes(expected), `${locale}/${reason}: ${sent.text}`)
+    conv.stopTurn()
+    await turn
+  }
+})
+
+test('the "allow everything" button is named like the web UI and hidden for git --no-verify', async () => {
+  for (const [locale, label] of [['fr', 'Tout autoriser'], ['en', 'Allow everything']]) {
+    const { conv, telegram, registered } = confirmConv({ locale })
+    await conv._ensureLocale()
+    const turn = conv.runTurn('s1', 'go')
+    registered[0].onEvent({ type: 'chat.path_confirmation', payload: { callId: 'p1', tool: 'run_command', paths: ['/x'], reason: 'outside_workdir' } })
+    registered[0].onEvent({ type: 'chat.path_confirmation', payload: { callId: 'p2', tool: 'run_command', paths: ['git commit --no-verify'], reason: 'git_no_verify' } })
+    await sleep(10)
+    const buttons = (id) => telegram.sent.find((m) => m.extra?.reply_markup?.inline_keyboard?.flat().some((b) => b.callback_data.includes(`:${id}:`))).extra.reply_markup.inline_keyboard.flat()
+    assert.ok(buttons('p1').some((b) => b.text === label && b.callback_data === 'path_confirm:p1:always'), `${locale}: ${JSON.stringify(buttons('p1'))}`)
+    assert.ok(!buttons('p2').some((b) => b.callback_data.endsWith(':always')), 'no blanket button for git --no-verify')
+    assert.equal(buttons('p2').length, 2)
+    conv.stopTurn()
+    await turn
+  }
+})
+
+test('"allow everything" switches the session to dangerous mode like the web UI, with a fallback to allow once', async () => {
+  const calls = []
+  let failSwitch = false
+  const { conv, telegram, registered } = confirmConv({
+    rest: {
+      async confirmPath(...a) { calls.push(['confirmPath', ...a]); return {} },
+      async setDangerLevel(...a) { calls.push(['setDangerLevel', ...a]); if (failSwitch) throw new Error('boom'); return {} },
+    },
+  })
+  const turn = conv.runTurn('s1', 'go')
+  registered[0].onEvent({ type: 'chat.path_confirmation', payload: { callId: 'p1', tool: 'run_command', paths: ['/x'], reason: 'outside_workdir' } })
+  await sleep(5)
+  await conv.handleCallback('path_confirm:p1:always')
+  assert.deepEqual(calls, [['setDangerLevel', 's1', 'dangerous']], 'the switch resolves the pending request on the server')
+  assert.equal(telegram.sent.at(-1).text, '✅ Mode dangereux activé : tout est autorisé pour cette session.')
+
+  calls.length = 0
+  failSwitch = true
+  registered[0].onEvent({ type: 'chat.path_confirmation', payload: { callId: 'p2', tool: 'run_command', paths: ['/y'], reason: 'outside_workdir' } })
+  await sleep(5)
+  await conv.handleCallback('path_confirm:p2:always')
+  assert.deepEqual(calls, [['setDangerLevel', 's1', 'dangerous'], ['confirmPath', 's1', 'p2', true, false]])
+  assert.match(telegram.sent.at(-1).text, /mode dangereux/i)
+  conv.stopTurn()
+  await turn
+})
+
+test('a permission click removes the buttons once, not twice', async () => {
+  const telegram = progressTelegram()
+  const edits = []
+  telegram.editMessageReplyMarkup = async (chatId, messageId) => { edits.push(messageId) }
+  const { subscribe, registered } = fakeSubscribe()
+  const r = createRuntime({ telegram, rest: runtimeRest(), subscribe, logger: noopLogger, auth: { userId: 1 } })
+  r.start()
+  telegram._push({ update_id: 1, message: { chat: { id: 7 }, from: { id: 1 }, text: '/send s1 go' } })
+  assert.ok(await until(() => registered.length > 0))
+  registered[0].onEvent({ type: 'chat.path_confirmation', payload: { callId: 'p1', tool: 'run_command', paths: ['/x'], reason: 'outside_workdir' } })
+  assert.ok(await until(() => telegram.sent.some((m) => m.text.includes('🔒'))))
+  const messageId = 100 + telegram.sent.findIndex((m) => m.text.includes('🔒'))
+  telegram._push({ update_id: 2, callback_query: { id: 'cb', from: { id: 1 }, message: { message_id: messageId, chat: { id: 7 } }, data: 'path_confirm:p1:allow' } })
+  assert.ok(await until(() => edits.length > 0))
+  await sleep(60)
+  r.stop()
+  assert.deepEqual(edits, [messageId])
+})
+
+test('routine confirmation and turn bookkeeping is logged at debug level, not info', async () => {
+  const infos = []
+  const logger = { debug() {}, info: (m) => infos.push(String(m)), warn() {}, error() {} }
+  const { subscribe, registered } = fakeSubscribe()
+  const conv = new Conversation({ chatId: 1, telegram: progressTelegram(), rest: { async getLocale() { return 'fr' }, async sendMessage() { return {}; }, async confirmPath() { return {} } }, logger, subscribe })
+  const turn = conv.runTurn('s1', 'go')
+  registered[0].onEvent({ type: 'chat.path_confirmation', payload: { callId: 'p1', tool: 'run_command', paths: ['/x'], reason: 'outside_workdir' } })
+  await sleep(5)
+  await conv.handleCallback('path_confirm:p1:allow')
+  registered[0].onEvent({ type: 'chat.done', payload: { messageId: 'sub', reason: 'complete', agentType: 'sub-agent' } })
+  registered[0].onEvent({ type: 'chat.done', payload: { messageId: 'w', reason: 'waiting_for_user' } })
+  conv.stopTurn()
+  await turn
+  assert.deepEqual(infos.filter((m) => /_showPathConfirmation|path_confirm callback|confirmPath result|buttons removed|no finish|removing path confirmation/.test(m)), [])
 })

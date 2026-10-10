@@ -118,11 +118,14 @@ const MESSAGES = {
     turn_timeout: '⚠️ Le tour a expiré sans réponse. Réessayez.',
     path_reason_dangerous: 'commande dangereuse',
     path_reason_outside: 'accès hors dossier',
+    path_reason_sensitive: 'fichier sensible',
+    path_reason_both: 'fichier sensible hors du projet',
+    path_reason_git: 'git --no-verify',
+    path_everything: 'Tout autoriser',
+    path_everything_allowed: '✅ Mode dangereux activé : tout est autorisé pour cette session.',
     path_allow: 'Autoriser',
     path_deny: 'Refuser',
-    path_always: 'Toujours autoriser',
     path_allowed: '✅ Autorisé.',
-    path_always_allowed: '✅ Toujours autorisé.',
     path_denied: '❌ Refusé.',
     path_danger_level_failed: '⚠️ Chemin autorisé, mais le mode dangereux n’a pas pu être activé.',
     history_header: '📜 Historique :',
@@ -190,11 +193,14 @@ const MESSAGES = {
     turn_timeout: '⚠️ The turn timed out without an answer. Try again.',
     path_reason_dangerous: 'dangerous command',
     path_reason_outside: 'outside the project folder',
+    path_reason_sensitive: 'sensitive file',
+    path_reason_both: 'sensitive file outside the project',
+    path_reason_git: 'git --no-verify',
+    path_everything: 'Allow everything',
+    path_everything_allowed: '✅ Dangerous mode on: everything is allowed for this session.',
     path_allow: 'Allow',
     path_deny: 'Deny',
-    path_always: 'Always allow',
     path_allowed: '✅ Allowed.',
-    path_always_allowed: '✅ Always allowed.',
     path_denied: '❌ Denied.',
     path_danger_level_failed: '⚠️ Path confirmed, but danger level could not be set.',
     history_header: '📜 History:',
@@ -209,6 +215,15 @@ const MESSAGES = {
 // the project's directory, so no path separator and no "..".
 function isValidProjectName(name) {
   return /^[a-zA-Z0-9._ -]+$/.test(name) && !name.includes('..')
+}
+
+// Wording of a permission request, by the reason OpenFox gives (as the web UI).
+const PATH_REASON_KEYS = {
+  outside_workdir: 'path_reason_outside',
+  sensitive_file: 'path_reason_sensitive',
+  both: 'path_reason_both',
+  dangerous_command: 'path_reason_dangerous',
+  git_no_verify: 'path_reason_git',
 }
 
 // chat.done reasons that end a turn ("waiting_for_user" does not: the agent
@@ -714,6 +729,8 @@ export class Conversation {
     // The active project and session survive a plugin or OpenFox restart.
     this.storage = storage ?? null
     this._savedState = null
+    // Messages whose buttons were already removed by the callback handler.
+    this._removedButtons = new Set()
     this._restoreState()
   }
 
@@ -949,10 +966,10 @@ export class Conversation {
       if (this.state.pendingPathConfirms) {
         for (const [callId, entry] of this.state.pendingPathConfirms) {
           if (entry.sessionId === sessionId) {
-            this.logger.info('telegram: finish() removing path confirmation buttons', { callId, messageId: entry.messageId })
+            this.logger.debug('telegram: finish() removing path confirmation buttons', { callId, messageId: entry.messageId })
             if (entry.messageId) {
               void this.telegram.editMessageReplyMarkup(this.chatId, entry.messageId, { inline_keyboard: [] })
-                .catch((e) => this.logger.error('telegram: editMessageReplyMarkup failed', { callId, messageId: entry.messageId, error: e?.message }))
+                .catch((e) => this.logger.warn('telegram: editMessageReplyMarkup failed', { callId, messageId: entry.messageId, error: e?.message }))
             }
             this.state.pendingPathConfirms.delete(callId)
           }
@@ -1013,29 +1030,31 @@ export class Conversation {
         this._showQuestion(msg.payload, sessionId)
       } else if (msg.type === 'chat.done') {
         if (msg.payload?.agentType === 'sub-agent') {
-          this.logger.info('telegram: chat.done (sub-agent), no finish', { reason: msg.payload.reason })
+          this.logger.debug('telegram: chat.done (sub-agent), no finish', { reason: msg.payload.reason })
           return
         }
         if (!TURN_END_REASONS.has(msg.payload.reason)) {
-          this.logger.info('telegram: chat.done (non-terminal reason), no finish', { reason: msg.payload.reason })
+          this.logger.debug('telegram: chat.done (non-terminal reason), no finish', { reason: msg.payload.reason })
           return
         }
         // The compaction turn's own chat.done: the real answer follows, so it
-        // must not send the summary nor end the turn. It still counts as a
-        // queued continuation, so it decrements turn.queued like any done.
+        // must not send the summary nor end the turn.
         const isCompactionDone =
           compactionSummaryId !== null &&
           msg.payload.reason === 'complete' &&
           msg.payload.messageId === compactionSummaryId
         if (isCompactionDone) compactionSummaryId = null
-        if (msg.payload.reason === 'complete' && turn.queued > 0) {
-          turn.queued--
-          if (!isCompactionDone) endSegment(msg.payload.messageId)
-          this.logger.info('telegram: chat.done (queued), no finish', { queued: turn.queued })
+        // The compaction's done is not the done of a queued message: it must
+        // not use up a queued continuation, or the turn would end before the
+        // answer to the queued message.
+        if (isCompactionDone) {
+          this.logger.debug('telegram: chat.done (compaction), no finish')
           return
         }
-        if (isCompactionDone) {
-          this.logger.info('telegram: chat.done (compaction), no finish')
+        if (msg.payload.reason === 'complete' && turn.queued > 0) {
+          turn.queued--
+          endSegment(msg.payload.messageId)
+          this.logger.debug('telegram: chat.done (queued), no finish', { queued: turn.queued })
           return
         }
         endSegment(msg.payload.messageId)
@@ -1065,29 +1084,37 @@ export class Conversation {
     }
   }
 
+  /** Whether the buttons of this message were already removed (and forget it). */
+  buttonsAlreadyRemoved(messageId) {
+    return this._removedButtons.delete(messageId)
+  }
+
   /** A permission request of the agent, with its buttons. */
   _showPathConfirmation(payload, sessionId) {
     const { callId, tool, paths, reason } = payload ?? {}
     const pathList = (paths ?? []).join(', ')
-    const reasonText = this.t(reason === 'dangerous_command' ? 'path_reason_dangerous' : 'path_reason_outside')
+    const reasonText = this.t(PATH_REASON_KEYS[reason] ?? 'path_reason_outside')
     const text = `🔒 ${tool} · ${reasonText}\n${pathList}`
     if (!this.state.pendingPathConfirms) this.state.pendingPathConfirms = new Map()
-    const keyboard = {
-      inline_keyboard: [
-        [
-          { text: this.t('path_allow'), callback_data: `path_confirm:${callId}:allow` },
-          { text: this.t('path_deny'), callback_data: `path_confirm:${callId}:deny` },
-        ],
-        [{ text: this.t('path_always'), callback_data: `path_confirm:${callId}:always` }],
+    const rows = [
+      [
+        { text: this.t('path_allow'), callback_data: `path_confirm:${callId}:allow` },
+        { text: this.t('path_deny'), callback_data: `path_confirm:${callId}:deny` },
       ],
+    ]
+    // Like the web UI: no blanket "allow everything" for git --no-verify,
+    // which always needs its own explicit consent.
+    if (reason !== 'git_no_verify') {
+      rows.push([{ text: this.t('path_everything'), callback_data: `path_confirm:${callId}:always` }])
     }
+    const keyboard = { inline_keyboard: rows }
     this.state.pendingPathConfirms.set(callId, { sessionId, messageId: null })
-    this.logger.info('telegram: _showPathConfirmation', { callId, tool, paths, reason })
+    this.logger.debug('telegram: _showPathConfirmation', { callId, tool, paths, reason })
     void this.telegram.sendMessage(this.chatId, text, { reply_markup: keyboard })
       .then((msg) => {
         const entry = this.state.pendingPathConfirms.get(callId)
         if (entry) entry.messageId = msg?.message_id ?? null
-        this.logger.info('telegram: _showPathConfirmation messageId set', { callId, messageId: msg?.message_id ?? null })
+        this.logger.debug('telegram: _showPathConfirmation messageId set', { callId, messageId: msg?.message_id ?? null })
       })
       .catch((e) => this.logger.error('telegram: _showPathConfirmation sendMessage failed', { callId, error: e?.message }))
   }
@@ -1208,10 +1235,10 @@ export class Conversation {
       if (this.state.pendingPathConfirms) {
         for (const [callId, entry] of this.state.pendingPathConfirms) {
           if (entry.sessionId === sessionId) {
-            this.logger.info('telegram: watcher chat.done removing path confirmation buttons', { callId, messageId: entry.messageId })
+            this.logger.debug('telegram: watcher chat.done removing path confirmation buttons', { callId, messageId: entry.messageId })
             if (entry.messageId) {
               void this.telegram.editMessageReplyMarkup(this.chatId, entry.messageId, { inline_keyboard: [] })
-                .catch((e) => this.logger.error('telegram: editMessageReplyMarkup failed', { callId, messageId: entry.messageId, error: e?.message }))
+                .catch((e) => this.logger.warn('telegram: editMessageReplyMarkup failed', { callId, messageId: entry.messageId, error: e?.message }))
             }
             this.state.pendingPathConfirms.delete(callId)
           }
@@ -1826,35 +1853,39 @@ export class Conversation {
       const entry = this.state.pendingPathConfirms?.get(callId)
       const sessionId = entry?.sessionId ?? this.state.sessionId
       this.state.pendingPathConfirms?.delete(callId)
-      this.logger.info('telegram: path_confirm callback', { data, sessionId, callId, action, entryMessageId: entry?.messageId ?? null })
+      this.logger.debug('telegram: path_confirm callback', { data, sessionId, callId, action, entryMessageId: entry?.messageId ?? null })
       // Remove the buttons immediately: the confirmation is being resolved,
       // whether from Telegram or from OpenFox.
       if (entry?.messageId) {
+        this._removedButtons.add(entry.messageId)
         void this.telegram.editMessageReplyMarkup(this.chatId, entry.messageId, { inline_keyboard: [] })
-          .then(() => this.logger.info('telegram: buttons removed via handleCallback', { callId, messageId: entry.messageId }))
-          .catch((err) => this.logger.error('telegram: editMessageReplyMarkup failed in handleCallback', { callId, messageId: entry.messageId, error: err?.message }))
+          .then(() => this.logger.debug('telegram: buttons removed via handleCallback', { callId, messageId: entry.messageId }))
+          .catch((err) => this.logger.warn('telegram: editMessageReplyMarkup failed in handleCallback', { callId, messageId: entry.messageId, error: err?.message }))
       } else {
-        this.logger.info('telegram: no messageId to remove buttons in handleCallback', { callId })
+        this.logger.debug('telegram: no messageId to remove buttons in handleCallback', { callId })
       }
       if (!sessionId) {
         return this.telegram.sendMessage(this.chatId, this.t('no_active_session'), { reply_markup: menuKeyboard({ session: false }) })
       }
       const approved = action === 'allow' || action === 'always'
-      const alwaysAllow = action === 'always'
       try {
-        const result = await this.rest.confirmPath(sessionId, callId, approved, alwaysAllow)
-        this.logger.info('telegram: confirmPath result', { sessionId, callId, approved, alwaysAllow, result })
-        if (alwaysAllow) {
+        if (action === 'always') {
+          // Like the web UI's "Allow everything": switch the session to
+          // dangerous mode; the server then approves the pending requests
+          // (this one included). If the switch fails, allow this one only.
           try {
             await this.rest.setDangerLevel(sessionId, 'dangerous')
-            this.logger.info('telegram: setDangerLevel dangerous', { sessionId })
+            this.logger.debug('telegram: setDangerLevel dangerous', { sessionId })
+            return this.telegram.sendMessage(this.chatId, this.t('path_everything_allowed'))
           } catch (e) {
             this.logger.error('telegram: setDangerLevel failed', { sessionId, error: e?.message })
+            await this.rest.confirmPath(sessionId, callId, true, false)
             return this.telegram.sendMessage(this.chatId, this.t('path_danger_level_failed'))
           }
         }
-        const msg = this.t(alwaysAllow ? 'path_always_allowed' : approved ? 'path_allowed' : 'path_denied')
-        return this.telegram.sendMessage(this.chatId, msg)
+        const result = await this.rest.confirmPath(sessionId, callId, approved, false)
+        this.logger.debug('telegram: confirmPath result', { sessionId, callId, approved, result })
+        return this.telegram.sendMessage(this.chatId, this.t(approved ? 'path_allowed' : 'path_denied'))
       } catch (e) {
         this.logger.error('telegram: confirmPath failed', { sessionId, callId, error: e?.message })
         return this.telegram.sendMessage(this.chatId, `⚠️ ${e?.message ?? 'error'}`)
@@ -2021,7 +2052,7 @@ export function createRuntime({ telegram, rest, subscribe, logger, auth = {}, hi
           logger.warn('telegram: could not delete the list', { chatId, error: e?.message })
         }
       }
-      if (cb.message?.message_id != null) {
+      if (cb.message?.message_id != null && !conv.buttonsAlreadyRemoved(cb.message.message_id)) {
         try {
           await telegram.editMessageReplyMarkup(chatId, cb.message.message_id)
         } catch (e) {
