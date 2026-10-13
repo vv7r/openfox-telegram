@@ -4656,3 +4656,68 @@ test('OpenFoxRestClient errors carry the HTTP status', async () => {
   assert.equal(e.status, 404)
   assert.match(e.message, /No pending question/)
 })
+
+// ---------------------------------------------------------------------------
+// A question's buttons go away however it is settled.
+// ---------------------------------------------------------------------------
+
+function questionTelegram() {
+  const t = progressTelegram()
+  t.edits = []
+  t.editMessageReplyMarkup = async (chatId, messageId) => { t.edits.push(messageId) }
+  return t
+}
+const choicePayload = { callId: 'qc', question: 'Quel langage ?', type: 'choice', options: [{ value: 'ts', label: 'TypeScript' }, { value: 'py', label: 'Python' }] }
+
+test('a choice question answered with a typed (custom) answer loses its buttons', async () => {
+  const telegram = questionTelegram()
+  const answers = []
+  const conv = new Conversation({ chatId: 1, telegram, rest: { async getLocale() { return 'fr' }, async answerQuestion(s, c, a) { answers.push(a) } }, logger: noopLogger, subscribe: fakeSubscribe().subscribe })
+  conv._showQuestion(choicePayload, 's1')
+  await sleep(5)
+  const questionId = 100 + telegram.sent.findIndex((m) => m.text.includes('Quel langage'))
+  await conv.handleText('Rust plutôt')
+  assert.deepEqual(answers, ['Rust plutôt'])
+  assert.deepEqual(telegram.edits, [questionId])
+})
+
+test('a question forgotten at the end of its turn, or gone on OpenFox, loses its buttons', async () => {
+  // end of the turn
+  const t1 = questionTelegram()
+  const { subscribe, registered } = fakeSubscribe()
+  const c1 = new Conversation({ chatId: 1, telegram: t1, rest: { async getLocale() { return 'fr' }, async sendMessage() { return {} } }, logger: noopLogger, subscribe })
+  const turn = c1.runTurn('s1', 'go')
+  registered[0].onEvent({ type: 'chat.ask_user', payload: choicePayload })
+  await sleep(5)
+  const q1 = 100 + t1.sent.findIndex((m) => m.text.includes('Quel langage'))
+  registered[0].onEvent({ type: 'chat.done', payload: { messageId: 'm', reason: 'complete' } })
+  await turn
+  assert.deepEqual(t1.edits, [q1])
+  // gone on OpenFox (404)
+  const t2 = questionTelegram()
+  const gone = Object.assign(new Error('OpenFox 404: No pending question with that ID'), { status: 404 })
+  const c2 = new Conversation({ chatId: 1, telegram: t2, rest: { async getLocale() { return 'fr' }, async answerQuestion() { throw gone } }, logger: noopLogger, subscribe: fakeSubscribe().subscribe })
+  c2._showQuestion(choicePayload, 's1')
+  await sleep(5)
+  const q2 = 100 + t2.sent.findIndex((m) => m.text.includes('Quel langage'))
+  await c2.handleCallback(t2.sent.find((m) => m.text.includes('Quel langage')).extra.reply_markup.inline_keyboard.flat()[0].callback_data)
+  assert.deepEqual(t2.edits, [q2])
+})
+
+test('a question answered with a button loses its buttons once, not twice', async () => {
+  const telegram = questionTelegram()
+  const { subscribe, registered } = fakeSubscribe()
+  const r = createRuntime({ telegram, rest: runtimeRest({ async answerQuestion() { return {} } }), subscribe, logger: noopLogger, auth: { userId: 1 } })
+  r.start()
+  telegram._push({ update_id: 1, message: { chat: { id: 7 }, from: { id: 1 }, text: '/send s1 go' } })
+  assert.ok(await until(() => registered.length > 0))
+  registered[0].onEvent({ type: 'chat.ask_user', payload: choicePayload })
+  assert.ok(await until(() => telegram.sent.some((m) => m.text.includes('Quel langage'))))
+  const q = telegram.sent.find((m) => m.text.includes('Quel langage'))
+  const qId = 100 + telegram.sent.indexOf(q)
+  telegram._push({ update_id: 2, callback_query: { id: 'cb', from: { id: 1 }, message: { message_id: qId, chat: { id: 7 } }, data: q.extra.reply_markup.inline_keyboard.flat()[1].callback_data } })
+  assert.ok(await until(() => telegram.edits.length > 0))
+  await sleep(60)
+  r.stop()
+  assert.deepEqual(telegram.edits, [qId])
+})

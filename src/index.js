@@ -1029,7 +1029,7 @@ export class Conversation {
       this._clearTimeout(timeoutId)
       // The questions of this turn can no longer be answered.
       for (const [token, q] of this.state.pendingQuestions) {
-        if (q.sessionId === sessionId) this.state.pendingQuestions.delete(token)
+        if (q.sessionId === sessionId) this._forgetQuestion(token)
       }
       // Remove the buttons from path confirmations of this turn.
       if (this.state.pendingPathConfirms) {
@@ -1194,7 +1194,8 @@ export class Conversation {
     // Each question has its own token: a button answers its own question,
     // even when the agent asks another one meanwhile.
     const token = String(++this._questionSeq)
-    this.state.pendingQuestions.set(token, { sessionId, callId, type, options: options ?? [] })
+    const entry = { sessionId, callId, type, options: options ?? [], messageId: null, hasButtons: false }
+    this.state.pendingQuestions.set(token, entry)
     let keyboard = null
     if (type === 'choice' && options?.length) {
       keyboard = { inline_keyboard: options.map((o, i) => [{ text: o.label ?? o.value, callback_data: `ask:${token}:${i}` }]) }
@@ -1202,7 +1203,24 @@ export class Conversation {
       keyboard = { inline_keyboard: [[{ text: this.t('yes'), callback_data: `ask:${token}:yes` }, { text: this.t('no'), callback_data: `ask:${token}:no` }]] }
     }
     const text = keyboard ? `❓ ${question}` : `❓ ${question}\n\n${this.t('answer_by_message')}`
-    void this.telegram.sendMessage(this.chatId, text, keyboard ? { reply_markup: keyboard } : {})
+    entry.hasButtons = Boolean(keyboard)
+    // The message id lets its buttons be removed however the question is settled.
+    return Promise.resolve(this.telegram.sendMessage(this.chatId, text, keyboard ? { reply_markup: keyboard } : {}))
+      .then((sent) => {
+        entry.messageId = sent?.message_id ?? null
+      })
+      .catch((e) => this.logger.warn('telegram: question not sent', { callId, error: e?.message }))
+  }
+
+  /** Forget a question and remove its buttons (answered by typing, gone on OpenFox, turn over). */
+  _forgetQuestion(token) {
+    const entry = this.state.pendingQuestions.get(token)
+    this.state.pendingQuestions.delete(token)
+    if (!entry?.hasButtons || entry.messageId == null) return
+    this._removedButtons.add(entry.messageId)
+    void Promise.resolve(this.telegram.editMessageReplyMarkup?.(this.chatId, entry.messageId)).catch((e) =>
+      this.logger.warn('telegram: question buttons not removed', { callId: entry.callId, error: e?.message }),
+    )
   }
 
   // --- follow mode: turns started from OpenFox (the web UI) ---
@@ -1302,7 +1320,7 @@ export class Conversation {
       if (!TURN_END_REASONS.has(p.reason)) return
       // The questions of this turn can no longer be answered.
       for (const [token, q] of this.state.pendingQuestions) {
-        if (q.sessionId === sessionId) this.state.pendingQuestions.delete(token)
+        if (q.sessionId === sessionId) this._forgetQuestion(token)
       }
       // Remove the buttons from path confirmations of this session.
       if (this.state.pendingPathConfirms) {
@@ -1497,14 +1515,14 @@ export class Conversation {
     try {
       await this.rest.answerQuestion(pq.sessionId, pq.callId, answer)
       // Removed once OpenFox has the answer: a failed answer can be sent again.
-      this.state.pendingQuestions.delete(token)
+      this._forgetQuestion(token)
       return this.telegram.sendMessage(this.chatId, this.t('answer_sent'))
     } catch (e) {
       // OpenFox no longer has the question (answered from the web UI, turn
       // over, restart): forget it, or every message would be taken as its
       // answer. A typed message then goes to the agent as a normal one.
       if (e?.status === 404 || e?.status === 410) {
-        this.state.pendingQuestions.delete(token)
+        this._forgetQuestion(token)
         this.logger.warn('telegram: question no longer pending on OpenFox, dropped', { sessionId: pq.sessionId, callId: pq.callId })
         if (!typed) return this.telegram.sendMessage(this.chatId, this.t('question_expired'))
         await this.telegram.sendMessage(this.chatId, this.t('question_gone_forward'))
