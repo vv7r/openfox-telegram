@@ -79,6 +79,7 @@ const MESSAGES = {
     file_too_big: '⚠️ Fichier trop volumineux (20 Mo maximum).',
     file_unsupported: '⚠️ Type de fichier non pris en charge : images, PDF ou fichiers texte.',
     question_expired: '⚠️ Cette question a expiré.',
+    question_gone_forward: "ℹ️ Cette question n'attend plus de réponse (répondue ailleurs ou expirée) : ton message est envoyé à l'agent.",
     yes: 'Oui',
     no: 'Non',
     usage_new: 'Usage : /new <nom>',
@@ -173,6 +174,7 @@ const MESSAGES = {
     file_too_big: '⚠️ File too big (20 MB maximum).',
     file_unsupported: '⚠️ Unsupported file type: images, PDFs or text files.',
     question_expired: '⚠️ This question has expired.',
+    question_gone_forward: 'ℹ️ This question is no longer waiting for an answer (answered elsewhere or expired): your message goes to the agent.',
     yes: 'Yes',
     no: 'No',
     usage_new: 'Usage: /new <name>',
@@ -535,7 +537,9 @@ export class OpenFoxRestClient {
       data = {}
     }
     if (res.status >= 400) {
-      throw new Error(`OpenFox ${res.status}: ${data?.error ?? 'request failed'}`)
+      const err = new Error(`OpenFox ${res.status}: ${data?.error ?? 'request failed'}`)
+      err.status = res.status
+      throw err
     }
     return data
   }
@@ -1296,6 +1300,10 @@ export class Conversation {
         return
       }
       if (!TURN_END_REASONS.has(p.reason)) return
+      // The questions of this turn can no longer be answered.
+      for (const [token, q] of this.state.pendingQuestions) {
+        if (q.sessionId === sessionId) this.state.pendingQuestions.delete(token)
+      }
       // Remove the buttons from path confirmations of this session.
       if (this.state.pendingPathConfirms) {
         for (const [callId, entry] of this.state.pendingPathConfirms) {
@@ -1483,7 +1491,7 @@ export class Conversation {
   }
 
   /** Answer a question: the one of a button (its token), or else the last one asked. */
-  async answerPendingQuestion(answer, token = [...this.state.pendingQuestions.keys()].at(-1)) {
+  async answerPendingQuestion(answer, token = [...this.state.pendingQuestions.keys()].at(-1), { typed = false } = {}) {
     const pq = this.state.pendingQuestions.get(token)
     if (!pq) return this.telegram.sendMessage(this.chatId, this.t('question_expired'))
     try {
@@ -1492,6 +1500,16 @@ export class Conversation {
       this.state.pendingQuestions.delete(token)
       return this.telegram.sendMessage(this.chatId, this.t('answer_sent'))
     } catch (e) {
+      // OpenFox no longer has the question (answered from the web UI, turn
+      // over, restart): forget it, or every message would be taken as its
+      // answer. A typed message then goes to the agent as a normal one.
+      if (e?.status === 404 || e?.status === 410) {
+        this.state.pendingQuestions.delete(token)
+        this.logger.warn('telegram: question no longer pending on OpenFox, dropped', { sessionId: pq.sessionId, callId: pq.callId })
+        if (!typed) return this.telegram.sendMessage(this.chatId, this.t('question_expired'))
+        await this.telegram.sendMessage(this.chatId, this.t('question_gone_forward'))
+        return this.forwardText(answer)
+      }
       this.logger.error('telegram: answerQuestion failed', { sessionId: pq.sessionId, callId: pq.callId, error: e?.message })
       return this.telegram.sendMessage(this.chatId, `⚠️ ${e?.message ?? 'error'}`)
     }
@@ -1512,7 +1530,7 @@ export class Conversation {
     if (!typed) return
     // A reply-keyboard key is its slash command.
     const t = KEYBOARD_COMMANDS[typed] ?? typed
-    if (this.hasPendingQuestion() && !isCommand(t)) return this.answerPendingQuestion(t)
+    if (this.hasPendingQuestion() && !isCommand(t)) return this.answerPendingQuestion(t, undefined, { typed: true })
     await this._ensureLocale()
 
     // Stage continuations (text that completes a pending action). A workdir is

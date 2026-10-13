@@ -4589,3 +4589,70 @@ test('/status shows the default model when the session has none of its own', asy
   await conv.handleText('/status')
   assert.match(telegram.sent.at(-1).text, /Modèle : modèle par défaut/)
 })
+
+// ---------------------------------------------------------------------------
+// A question that no longer exists on OpenFox must not swallow messages.
+// ---------------------------------------------------------------------------
+
+function goneError() {
+  const e = new Error('OpenFox 404: No pending question with that ID')
+  e.status = 404
+  return e
+}
+
+test('a typed answer to a question OpenFox no longer has goes to the agent as a normal message', async () => {
+  const sentToSession = []
+  const telegram = fakeTelegram()
+  const { subscribe } = fakeSubscribe()
+  const rest = {
+    async getLocale() { return 'fr' },
+    async answerQuestion() { throw goneError() },
+    async sendMessage(id, content) { sentToSession.push({ id, content }); return {} },
+  }
+  const conv = new Conversation({ chatId: 1, telegram, rest, logger: noopLogger, subscribe })
+  conv.state.sessionId = 's1'
+  conv.state.stage = 'active'
+  conv._showQuestion({ callId: 'q1', question: 'Nom ?', type: 'text' }, 's1')
+  const turn = conv.handleText('fais plutôt le point')
+  await sleep(10)
+  assert.ok(!conv.hasPendingQuestion(), 'the stale question is dropped')
+  assert.deepEqual(sentToSession, [{ id: 's1', content: 'fais plutôt le point' }])
+  assert.ok(telegram.sent.some((m) => /n'attend plus de réponse/.test(m.text)), JSON.stringify(telegram.sent.map((m) => m.text)))
+  conv.stopTurn()
+  await turn
+  // The next message is a normal message too.
+  assert.ok(!conv.hasPendingQuestion())
+})
+
+test('a button answer to a question OpenFox no longer has says it expired, nothing is sent to the agent', async () => {
+  const sentToSession = []
+  const telegram = fakeTelegram()
+  const rest = { async getLocale() { return 'fr' }, async answerQuestion() { throw goneError() }, async sendMessage(...a) { sentToSession.push(a); return {} } }
+  const conv = new Conversation({ chatId: 1, telegram, rest, logger: noopLogger, subscribe: fakeSubscribe().subscribe })
+  conv._showQuestion({ callId: 'q1', question: 'On y va ?', type: 'confirm' }, 's1')
+  await sleep(5)
+  const yes = telegram.sent.at(-1).extra.reply_markup.inline_keyboard.flat()[0].callback_data
+  await conv.handleCallback(yes)
+  assert.ok(!conv.hasPendingQuestion())
+  assert.deepEqual(sentToSession, [])
+  assert.match(telegram.sent.at(-1).text, /expiré/)
+})
+
+test('follow mode: the questions of an OpenFox turn are forgotten when that turn ends', async () => {
+  const { conv, open } = followConv()
+  conv.syncWatcher()
+  const ev = open()[0].onEvent
+  ev({ type: 'chat.ask_user', payload: { callId: 'qw', question: 'Quel nom ?', type: 'text' } })
+  await sleep(5)
+  assert.ok(conv.hasPendingQuestion())
+  ev({ type: 'chat.done', payload: { messageId: 'w1', reason: 'complete' } })
+  await sleep(5)
+  assert.ok(!conv.hasPendingQuestion(), 'a message typed after the turn is not taken as an answer')
+})
+
+test('OpenFoxRestClient errors carry the HTTP status', async () => {
+  const client = new OpenFoxRestClient({ baseUrl: 'http://x', fetchImpl: async () => ({ status: 404, json: async () => ({ error: 'No pending question with that ID' }) }) })
+  const e = await client.answerQuestion('s', 'c', 'x').catch((err) => err)
+  assert.equal(e.status, 404)
+  assert.match(e.message, /No pending question/)
+})
