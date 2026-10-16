@@ -1,6 +1,8 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import {
+  workflowSummary,
+  criteriaCountLine,
   chunkMessage,
   cleanBotToken,
   normalizeUserId,
@@ -3433,7 +3435,7 @@ test('createWsSubscribe forwards agent questions (chat.ask_user) but never reaso
     const ws = sockets[0]
     ws._emit('open', {})
     assert.deepEqual(ws.sent[0], { id: 'load', type: 'session.load', payload: { sessionId: 's1' } })
-    for (const type of ['chat.ask_user', 'chat.thinking', 'chat.done']) ws._emit('message', { data: JSON.stringify({ type, payload: {} }) })
+    for (const type of ['chat.ask_user', 'chat.done']) ws._emit('message', { data: JSON.stringify({ type, payload: {} }) })
     assert.deepEqual(got, ['chat.ask_user', 'chat.done'])
   } finally {
     globalThis.WebSocket = original
@@ -3542,6 +3544,7 @@ function multiSubscribe() {
   const subscribe = (sessionId, onEvent, opts = {}) => {
     const sub = { sessionId, onEvent, onClose: opts.onClose, open: true }
     subs.push(sub)
+    opts.onOpen?.()
     return () => { sub.open = false }
   }
   const open = () => subs.filter((s) => s.open)
@@ -3953,7 +3956,7 @@ test('the "/" menu is set at start, in French and in English, with the commands 
   assert.ok(!calls.some((c) => c.commands.length === 0), 'never cleared')
   const fr = calls.find((c) => c.lang === null)
   const en = calls.find((c) => c.lang === 'en')
-  const names = ['start', 'stop', 'agents', 'status', 'model', 'sessions', 'new', 'new_session']
+  const names = ['start', 'stop', 'agents', 'status', 'model', 'criteria', 'sessions', 'new', 'new_session']
   assert.deepEqual(fr.commands.map((c) => c.command), names)
   assert.deepEqual(en.commands.map((c) => c.command), names)
   for (const c of [...fr.commands, ...en.commands]) assert.match(c.command, /^[a-z0-9_]{1,32}$/)
@@ -4720,4 +4723,906 @@ test('a question answered with a button loses its buttons once, not twice', asyn
   await sleep(60)
   r.stop()
   assert.deepEqual(telegram.edits, [qId])
+})
+
+// ---------------------------------------------------------------------------
+// "Typing…" while a turn started from OpenFox runs (follow mode), and the
+// reasoning as a content-less activity signal.
+// ---------------------------------------------------------------------------
+
+function typingConv({ follow = () => true, rest = {} } = {}) {
+  const timer = fakeTimer()
+  const telegram = progressTelegram()
+  telegram.actions = 0
+  telegram.sendChatAction = async () => { telegram.actions++ }
+  const ms = multiSubscribe()
+  const conv = new Conversation({
+    chatId: 1,
+    telegram,
+    rest: { async getLocale() { return 'fr' }, async sendMessage() { return {} }, ...rest },
+    logger: noopLogger,
+    subscribe: ms.subscribe,
+    follow,
+    timer,
+  })
+  conv._locale = 'fr'
+  conv.state.sessionId = 's1'
+  conv.state.stage = 'active'
+  const tickAll = () => { for (let id = 1; id <= 50; id++) timer._tick(id) }
+  return { conv, telegram, timer, tickAll, ...ms }
+}
+
+test('createWsSubscribe forwards the running state and the reasoning as a signal without its content', () => {
+  const { FakeWS, sockets } = fakeWebSocketClass()
+  const original = globalThis.WebSocket
+  globalThis.WebSocket = FakeWS
+  try {
+    const got = []
+    createWsSubscribe('http://127.0.0.1:10369', noopLogger)('s1', (m) => got.push(m))
+    const ws = sockets[0]
+    ws._emit('message', { data: JSON.stringify({ type: 'chat.thinking', payload: { messageId: 'm', content: 'SECRET REASONING' } }) })
+    ws._emit('message', { data: JSON.stringify({ type: 'session.running', payload: { isRunning: true } }) })
+    assert.deepEqual(got, [{ type: 'chat.thinking', payload: {} }, { type: 'session.running', payload: { isRunning: true } }])
+    assert.ok(!JSON.stringify(got).includes('SECRET'), 'the reasoning never reaches the plugin')
+  } finally {
+    globalThis.WebSocket = original
+  }
+})
+
+test('follow: "typing…" shows while an OpenFox turn runs and stops at its end', () => {
+  const { conv, telegram, tickAll, open } = typingConv()
+  conv.syncWatcher()
+  const ev = open()[0].onEvent
+  ev({ type: 'session.running', payload: { isRunning: true } })
+  assert.ok(telegram.actions >= 1, 'shown at once')
+  const before = telegram.actions
+  tickAll()
+  assert.ok(telegram.actions > before, 'kept alive')
+  ev({ type: 'chat.done', payload: { messageId: 'w', reason: 'complete' } })
+  const after = telegram.actions
+  tickAll()
+  assert.equal(telegram.actions, after, 'stopped at the end of the turn')
+})
+
+test('follow: the reasoning alone shows "typing…"; running false or waiting for the user stops it', () => {
+  const { conv, telegram, tickAll, open } = typingConv()
+  conv.syncWatcher()
+  const ev = open()[0].onEvent
+  ev({ type: 'chat.thinking', payload: {} })
+  assert.equal(telegram.actions, 1)
+  ev({ type: 'session.running', payload: { isRunning: false } })
+  tickAll()
+  assert.equal(telegram.actions, 1, 'stopped when the turn is no longer running')
+  ev({ type: 'chat.thinking', payload: {} })
+  ev({ type: 'chat.done', payload: { messageId: 'w', reason: 'waiting_for_user' } })
+  const n = telegram.actions
+  tickAll()
+  assert.equal(telegram.actions, n, 'stopped while the agent waits for an answer')
+})
+
+test('follow: no second "typing…" during a turn started from Telegram', () => {
+  const { conv, open } = typingConv()
+  conv.syncWatcher()
+  const watcher = conv._watcher
+  const turn = conv.runTurn('s1', 'go')
+  open()[0].onEvent({ type: 'session.running', payload: { isRunning: true } })
+  assert.equal(watcher.stopTyping, null)
+  conv.stopTurn()
+  return turn
+})
+
+test('follow: "typing…" stops when following stops, or after a silence when OpenFox cannot confirm the turn runs', async () => {
+  let on = true
+  const { conv, telegram, timer, tickAll, open } = typingConv({ follow: () => on })
+  conv.syncWatcher()
+  open()[0].onEvent({ type: 'session.running', payload: { isRunning: true } })
+  on = false
+  conv.syncWatcher()
+  let n = telegram.actions
+  tickAll()
+  assert.equal(telegram.actions, n, 'stopped when following stops')
+  on = true
+  conv.syncWatcher()
+  open().at(-1).onEvent({ type: 'chat.thinking', payload: {} })
+  for (let id = 1; id <= 50; id++) timer._fireTimeout(id)
+  await sleep(5)
+  n = telegram.actions
+  tickAll()
+  assert.equal(telegram.actions, n, 'stopped after a long silence')
+})
+
+test('follow: "typing…" shows at once when following a session that is already running', async () => {
+  const { conv, telegram } = typingConv({ rest: { async getSessionDetail() { return { session: { isRunning: true } } } } })
+  conv.syncWatcher()
+  await sleep(5)
+  assert.ok(telegram.actions >= 1)
+})
+
+test('a long reasoning keeps a Telegram turn alive (the reasoning signal restarts its watchdog)', async () => {
+  const timer = fakeTimer()
+  const telegram = fakeTelegram()
+  const { subscribe, registered } = fakeSubscribe()
+  const conv = new Conversation({ chatId: 1, telegram, rest: { async getLocale() { return 'fr' }, async sendMessage() { return {} } }, logger: noopLogger, subscribe, timer })
+  const turn = conv.handleText('/send s1 go')
+  await sleep(5)
+  registered[0].onEvent({ type: 'chat.thinking', payload: {} })
+  timer._fireTimeout(1)
+  assert.ok(!telegram.sent.some((m) => m.text.includes('expiré')), 'the first deadline was moved by the reasoning')
+  conv.stopTurn()
+  await turn
+})
+
+// ---------------------------------------------------------------------------
+// The silence guard asks OpenFox before giving up; a command's output counts
+// as activity (without its content).
+// ---------------------------------------------------------------------------
+
+test('createWsSubscribe forwards a command output as an activity signal without its content', () => {
+  const { FakeWS, sockets } = fakeWebSocketClass()
+  const original = globalThis.WebSocket
+  globalThis.WebSocket = FakeWS
+  try {
+    const got = []
+    createWsSubscribe('http://127.0.0.1:10369', noopLogger)('s1', (m) => got.push(m))
+    sockets[0]._emit('message', { data: JSON.stringify({ type: 'chat.tool_output', payload: { callId: 'c', output: 'PRINTED SECRET' } }) })
+    assert.deepEqual(got, [{ type: 'chat.tool_output', payload: {} }])
+  } finally {
+    globalThis.WebSocket = original
+  }
+})
+
+test('a silent Telegram turn does not expire while OpenFox says it is still running', async () => {
+  const timer = fakeTimer()
+  const telegram = fakeTelegram()
+  let running = true
+  const { subscribe } = fakeSubscribe()
+  const rest = { async getLocale() { return 'fr' }, async sendMessage() { return {} }, async getSessionDetail() { return { session: { isRunning: running } } } }
+  const conv = new Conversation({ chatId: 1, telegram, rest, logger: noopLogger, subscribe, timer })
+  const turn = conv.runTurn('s1', 'go')
+  await sleep(5)
+  timer._fireTimeout(1) // 5 minutes of silence, the turn still runs (a long command, a slow start)
+  await sleep(5)
+  assert.ok(!telegram.sent.some((m) => m.text.includes('expiré')), 'still running: no expiry')
+  running = false
+  for (let id = 2; id <= 10; id++) timer._fireTimeout(id)
+  await turn
+  assert.ok(telegram.sent.some((m) => m.text.includes('expiré')), 'over on OpenFox: the turn expires')
+})
+
+test('follow: after a silence, "typing…" stays while OpenFox says the turn runs, and stops when it does not', async () => {
+  let running = true
+  const { conv, telegram, timer, tickAll, open } = typingConv({ rest: { async getSessionDetail() { return { session: { isRunning: running } } } } })
+  conv.syncWatcher()
+  await sleep(5)
+  open()[0].onEvent({ type: 'chat.tool_call', payload: { callId: 'c', tool: 'run_command', args: { command: 'npm test' } } })
+  for (let id = 1; id <= 50; id++) timer._fireTimeout(id)
+  await sleep(5)
+  let n = telegram.actions
+  tickAll()
+  assert.ok(telegram.actions > n, 'still running: "typing…" kept')
+  running = false
+  for (let id = 1; id <= 50; id++) timer._fireTimeout(id)
+  await sleep(5)
+  n = telegram.actions
+  tickAll()
+  assert.equal(telegram.actions, n, 'over on OpenFox: stopped')
+})
+
+test('follow: a command output keeps "typing…" going', () => {
+  const { conv, telegram, open } = typingConv()
+  conv.syncWatcher()
+  open()[0].onEvent({ type: 'chat.tool_output', payload: {} })
+  assert.equal(telegram.actions, 1)
+})
+
+// ---------------------------------------------------------------------------
+// Criteria and workflow launch (the web UI's criteria sidebar and "▶ Build & Verify").
+// ---------------------------------------------------------------------------
+
+const BUILD_WF = { id: 'default', name: 'Build & Verify', scope: 'builtin', subGroups: ['build', 'verify', 'code review', 'summarize'] }
+const PARAM_WF = { id: 'fix-issue', name: 'Fix issue', scope: 'user', parameters: [{ name: 'issue', required: true }] }
+
+function criteriaSession(overrides = {}) {
+  return {
+    id: 's1',
+    workdir: '/w',
+    phase: 'plan',
+    isRunning: false,
+    metadataEntries: {
+      criteria: [
+        { id: '0', description: 'Le script existe', status: 'passed' },
+        { id: '2', description: 'Les tests passent', status: 'pending' },
+      ],
+    },
+    ...overrides,
+  }
+}
+
+function criteriaConv({ session = criteriaSession(), detail = {}, rest = {}, workflows = [BUILD_WF, PARAM_WF], timer } = {}) {
+  const telegram = progressTelegram()
+  const calls = { put: [], launch: [], workflows: [] }
+  const ms = multiSubscribe()
+  const conv = new Conversation({
+    chatId: 1,
+    telegram,
+    rest: {
+      async getLocale() { return 'fr' },
+      async sendMessage() { return {} },
+      async getSessionDetail() { return { session, messages: [], activeWorkflowExecution: null, ...detail } },
+      async listWorkflows(workdir) { calls.workflows.push(workdir); return workflows },
+      async setCriteria(id, criteria) { calls.put.push({ id, criteria }); session.metadataEntries.criteria = criteria; return { success: true } },
+      async launchWorkflow(id, launch) { calls.launch.push({ id, ...launch }); return { status: 'started' } },
+      async stopSession() { return {} },
+      ...rest,
+    },
+    logger: noopLogger,
+    subscribe: ms.subscribe,
+    ...(timer ? { timer } : {}),
+  })
+  conv._locale = 'fr'
+  conv.state.sessionId = 's1'
+  conv.state.stage = 'active'
+  return { conv, telegram, calls, session, ...ms }
+}
+
+test('OpenFoxRestClient.listWorkflows merges the built-in, user and project workflows of the workdir', async () => {
+  const urls = []
+  const client = new OpenFoxRestClient({
+    baseUrl: 'http://x',
+    fetchImpl: async (url) => {
+      urls.push(String(url))
+      return { status: 200, json: async () => ({ defaults: [{ id: 'a' }], userItems: [{ id: 'b' }], projectItems: [{ id: 'c' }] }) }
+    },
+  })
+  const list = await client.listWorkflows('/home/me/projet')
+  assert.deepEqual(list.map((w) => w.id), ['a', 'b', 'c'])
+  assert.equal(urls[0], 'http://x/api/workflows?workdir=%2Fhome%2Fme%2Fprojet')
+})
+
+test('OpenFoxRestClient.setCriteria PUTs the whole list', async () => {
+  const calls = []
+  const client = new OpenFoxRestClient({ baseUrl: 'http://x', fetchImpl: async (url, opts) => { calls.push([String(url), opts]); return { status: 200, json: async () => ({ success: true }) } } })
+  await client.setCriteria('s1', [{ id: '0', description: 'd', status: 'pending' }])
+  assert.equal(calls[0][0], 'http://x/api/sessions/s1/criteria')
+  assert.equal(calls[0][1].method, 'PUT')
+  assert.deepEqual(JSON.parse(calls[0][1].body), { criteria: [{ id: '0', description: 'd', status: 'pending' }] })
+})
+
+test('OpenFoxRestClient.launchWorkflow sends runner.launch over the WebSocket and resolves on its ack', async () => {
+  const { FakeWS, sockets } = fakeWebSocketClass()
+  const client = new OpenFoxRestClient({ baseUrl: 'http://127.0.0.1:10369', WebSocketImpl: FakeWS })
+  const p = client.launchWorkflow('s1', { workflowId: 'default', subGroup: 'verify', scope: 'builtin' })
+  const ws = sockets[0]
+  assert.equal(ws.url, 'ws://127.0.0.1:10369/ws')
+  ws._emit('open', {})
+  const sent = ws.sent[0]
+  assert.equal(sent.type, 'runner.launch')
+  assert.deepEqual(sent.payload, { sessionId: 's1', workflowId: 'default', subGroup: 'verify', scope: 'builtin' })
+  ws._emit('message', { data: JSON.stringify({ type: 'ack', id: 'other', payload: {} }) })
+  ws._emit('message', { data: JSON.stringify({ type: 'ack', id: sent.id, payload: {} }) })
+  assert.deepEqual(await p, { status: 'started' })
+})
+
+test('OpenFoxRestClient.launchWorkflow: queued when the agent works, an error message otherwise', async () => {
+  const { FakeWS, sockets } = fakeWebSocketClass()
+  const client = new OpenFoxRestClient({ baseUrl: 'http://x', WebSocketImpl: FakeWS })
+  const queued = client.launchWorkflow('s1', { workflowId: 'default' })
+  sockets[0]._emit('open', {})
+  sockets[0]._emit('message', { data: JSON.stringify({ type: 'queue.state', id: sockets[0].sent[0].id, payload: { success: true } }) })
+  assert.deepEqual(await queued, { status: 'queued' })
+  const failed = client.launchWorkflow('s1', {})
+  sockets[1]._emit('open', {})
+  assert.deepEqual(sockets[1].sent[0].payload, { sessionId: 's1', scope: 'auto' })
+  sockets[1]._emit('message', { data: JSON.stringify({ type: 'error', id: sockets[1].sent[0].id, payload: { code: 'NO_WORK', message: 'Aucun critère en attente' } }) })
+  await assert.rejects(failed, /Aucun critère en attente/)
+  const dropped = client.launchWorkflow('s1', {})
+  sockets[2].close()
+  await assert.rejects(dropped)
+})
+
+test('/criteria lists the criteria with their state, an add button and the launch buttons', async () => {
+  const { conv, telegram, calls } = criteriaConv()
+  await conv.handleText('/criteria')
+  const m = telegram.sent.at(-1)
+  assert.ok(m.text.includes('✅ Le script existe'), m.text)
+  assert.ok(m.text.includes('⏳ Les tests passent'), m.text)
+  const buttons = keyboardOf(m)
+  const texts = buttons.map((b) => b.text)
+  assert.ok(texts.includes('➕ Ajouter'), JSON.stringify(texts))
+  assert.ok(texts.includes('▶ Build & Verify'), JSON.stringify(texts))
+  assert.ok(texts.includes('⋮'), 'the steps of a workflow with sub-groups')
+  assert.ok(!texts.some((t) => t.includes('Fix issue')), 'a workflow with parameters is launched from the web UI')
+  assert.ok(m.text.includes('interface web'), m.text)
+  assert.deepEqual(calls.workflows, ['/w'])
+  assert.ok(allCallbacksFit(telegram))
+})
+
+test('/criteria: no criterion, only the add buttons; nothing pending, no launch button', async () => {
+  const empty = criteriaConv({ session: criteriaSession({ metadataEntries: {} }) })
+  await empty.conv.handleText('/criteria')
+  assert.ok(empty.telegram.sent.at(-1).text.includes('Aucun critère'))
+  assert.deepEqual(keyboardOf(empty.telegram.sent.at(-1)).map((b) => b.text), ['➕ Ajouter', '🤖 Ajouter les critères proposés', '✖ Annuler'])
+  const s = criteriaSession()
+  s.metadataEntries.criteria[1].status = 'passed'
+  const done = criteriaConv({ session: s })
+  await done.conv.handleText('/criteria')
+  assert.deepEqual(keyboardOf(done.telegram.sent.at(-1)).map((b) => b.text), ['➕ Ajouter', '🤖 Ajouter les critères proposés', '✖ Annuler'])
+})
+
+test('/criteria without an active session asks to pick one', async () => {
+  const { conv, telegram } = criteriaConv()
+  conv.state.sessionId = null
+  await conv.handleText('/criteria')
+  assert.ok(telegram.sent.at(-1).text.includes('Pas de session active'), telegram.sent.at(-1).text)
+})
+
+test('adding criteria: one per line, numbered after the highest id, the whole list PUT, the list shown again', async () => {
+  const { conv, telegram, calls } = criteriaConv()
+  await conv.handleCallback('crit:add')
+  assert.ok(telegram.sent.at(-1).text.includes('critère'))
+  await conv.handleText('Le README est à jour\n\n  La CI passe  ')
+  assert.equal(calls.put.length, 1)
+  assert.deepEqual(calls.put[0].criteria, [
+    { id: '0', description: 'Le script existe', status: 'passed' },
+    { id: '2', description: 'Les tests passent', status: 'pending' },
+    { id: '3', description: 'Le README est à jour', status: 'pending' },
+    { id: '4', description: 'La CI passe', status: 'pending' },
+  ])
+  const texts = telegram.sent.map((m) => m.text)
+  assert.ok(texts.some((t) => t.includes('2 critères ajoutés')), JSON.stringify(texts))
+  assert.ok(telegram.sent.at(-1).text.includes('⏳ La CI passe'))
+  // The next message goes to the agent again.
+  await conv.handleText('/status')
+  assert.equal(calls.put.length, 1)
+})
+
+test('adding criteria: a command cancels, the text is not added', async () => {
+  const { conv, calls } = criteriaConv({ rest: { async listAgents() { return [] } } })
+  await conv.handleCallback('crit:add')
+  await conv.handleText('/agents')
+  // The next text goes to the agent.
+  const turn = conv.handleText('pas un critère')
+  await sleep(5)
+  assert.equal(conv.isTurnRunning(), true)
+  conv.stopTurn()
+  await turn
+  assert.equal(calls.put.length, 0)
+})
+
+test('the end of a turn offers the build when criteria are pending, as the web UI does', async () => {
+  const { conv, telegram, registered } = (() => {
+    const c = criteriaConv()
+    return { ...c, registered: c.subs }
+  })()
+  const turn = conv.handleText('planifie')
+  await sleep(5)
+  const ev = registered[0].onEvent
+  ev({ type: 'chat.delta', payload: { messageId: 'a1', content: 'Voici le plan.' } })
+  ev({ type: 'chat.done', payload: { messageId: 'a1', reason: 'complete' } })
+  await turn
+  const offer = telegram.sent.at(-1)
+  assert.ok(offer.text.includes('1 critère en attente'), offer.text)
+  const texts = keyboardOf(offer).map((b) => b.text)
+  assert.ok(texts.includes('📋 Voir les critères'))
+  assert.ok(texts.includes('▶ Build & Verify'))
+})
+
+for (const [label, opts] of [
+  ['the session is done', { session: criteriaSession({ phase: 'done' }) }],
+  ['a workflow runs', { detail: { activeWorkflowExecution: { status: 'running' } } }],
+  ['a workflow waits for the user', { detail: { activeWorkflowExecution: { status: 'waiting', workflowName: 'Build & Verify' } } }],
+  ['nothing is pending', { session: criteriaSession({ metadataEntries: { criteria: [{ id: '0', description: 'x', status: 'passed' }] } }) }],
+]) {
+  test(`no build offer at the end of a turn when ${label}`, async () => {
+    const { conv, telegram, subs } = criteriaConv(opts)
+    const turn = conv.handleText('salut')
+    await sleep(5)
+    subs[0].onEvent({ type: 'chat.delta', payload: { messageId: 'a1', content: 'Bonjour.' } })
+    subs[0].onEvent({ type: 'chat.done', payload: { messageId: 'a1', reason: 'complete' } })
+    await turn
+    assert.ok(!telegram.sent.some((m) => keyboardOf(m).some((b) => b.text.startsWith('▶ Build'))), JSON.stringify(telegram.sent.map((m) => m.text)))
+  })
+}
+
+test('a stopped turn offers nothing', async () => {
+  const { conv, telegram } = criteriaConv()
+  const turn = conv.handleText('planifie')
+  await sleep(5)
+  await conv.handleText('/stop')
+  await turn
+  assert.ok(!telegram.sent.some((m) => keyboardOf(m).some((b) => b.text.startsWith('▶'))))
+})
+
+async function launchFrom(conv, telegram, text = '▶ Build & Verify') {
+  await conv.handleText('/criteria')
+  const button = keyboardOf(telegram.sent.at(-1)).find((b) => b.text === text)
+  assert.ok(button, `no button ${text}`)
+  await conv.handleCallback(button.callback_data)
+  await sleep(5)
+}
+
+test('a launch button starts the workflow and follows it to its end, not to the end of its first step', async () => {
+  const { conv, telegram, calls, subs } = criteriaConv()
+  await launchFrom(conv, telegram)
+  assert.deepEqual(calls.launch, [{ id: 's1', workflowId: 'default', scope: 'builtin' }])
+  assert.ok(telegram.sent.some((m) => m.text.includes('Build & Verify lancé')), JSON.stringify(telegram.sent.map((m) => m.text)))
+  assert.equal(conv.isTurnRunning(), true)
+  const ev = subs.at(-1).onEvent
+  ev({ type: 'session.running', payload: { isRunning: true } })
+  ev({ type: 'chat.delta', payload: { messageId: 'b1', content: 'Implémenté.' } })
+  ev({ type: 'chat.done', payload: { messageId: 'b1', reason: 'step_done' } })
+  ev({ type: 'chat.delta', payload: { messageId: 'v1', content: 'Vérifié.' } })
+  ev({ type: 'chat.done', payload: { messageId: 'v1', reason: 'step_done' } })
+  await sleep(5)
+  assert.equal(conv.isTurnRunning(), true, 'a step is not the end of the workflow')
+  const texts = () => telegram.sent.map((m) => m.text)
+  assert.ok(texts().includes('Implémenté.') && texts().includes('Vérifié.'), JSON.stringify(texts()))
+  ev({ type: 'session.running', payload: { isRunning: false } })
+  await sleep(10)
+  assert.equal(conv.isTurnRunning(), false)
+  const end = telegram.sent.at(-1)
+  assert.ok(end.text.startsWith('🏁 Build & Verify terminé'), end.text)
+  assert.ok(end.text.includes('📋 Critères : ✅ 1 validé · ⏳ 1 en attente'), end.text)
+  assert.ok(!end.text.includes('Les tests passent'), 'the criteria are counted, not listed')
+})
+
+test('a workflow launch: a running state of false before OpenFox acknowledged the launch does not end it', async () => {
+  let ack
+  const { conv, telegram, subs } = criteriaConv({ rest: { launchWorkflow: () => new Promise((resolve) => { ack = resolve }) } })
+  await launchFrom(conv, telegram)
+  subs.at(-1).onEvent({ type: 'session.running', payload: { isRunning: false } })
+  ack({ status: 'started' })
+  await sleep(5)
+  assert.equal(conv.isTurnRunning(), true)
+  subs.at(-1).onEvent({ type: 'session.running', payload: { isRunning: false } })
+  await sleep(5)
+  assert.equal(conv.isTurnRunning(), false)
+})
+
+test('/stop stops a workflow launched from Telegram', async () => {
+  const stopped = []
+  const { conv, telegram } = criteriaConv({ rest: { async stopSession(id) { stopped.push(id); return {} } } })
+  await launchFrom(conv, telegram)
+  await conv.handleText('/stop')
+  await sleep(5)
+  assert.deepEqual(stopped, ['s1'])
+  assert.equal(conv.isTurnRunning(), false)
+})
+
+test('a workflow launch queued by OpenFox says so and waits for nothing', async () => {
+  const { conv, telegram } = criteriaConv({ rest: { async launchWorkflow() { return { status: 'queued' } } } })
+  await launchFrom(conv, telegram)
+  assert.ok(telegram.sent.at(-1).text.includes('mis en file'), telegram.sent.at(-1).text)
+  assert.equal(conv.isTurnRunning(), false)
+})
+
+test('a refused workflow launch shows the reason', async () => {
+  const { conv, telegram } = criteriaConv({ rest: { async launchWorkflow() { throw new Error('Aucun critère en attente sur lequel travailler') } } })
+  await launchFrom(conv, telegram)
+  assert.ok(telegram.sent.at(-1).text.includes('⚠️') && telegram.sent.at(-1).text.includes('Aucun critère en attente'), telegram.sent.at(-1).text)
+  assert.equal(conv.isTurnRunning(), false)
+})
+
+test('the ⋮ button offers the full workflow or one of its steps', async () => {
+  const { conv, telegram, calls } = criteriaConv()
+  await launchFrom(conv, telegram, '⋮')
+  const menu = telegram.sent.at(-1)
+  const texts = keyboardOf(menu).map((b) => b.text)
+  assert.deepEqual(texts, ['Workflow complet', 'build', 'verify', 'code review', 'summarize', '✖ Annuler'])
+  await conv.handleCallback(keyboardOf(menu).find((b) => b.text === 'verify').callback_data)
+  await sleep(5)
+  assert.deepEqual(calls.launch, [{ id: 's1', workflowId: 'default', subGroup: 'verify', scope: 'builtin' }])
+  assert.ok(telegram.sent.some((m) => m.text.includes('Build & Verify · verify lancé')))
+  conv.stopTurn()
+})
+
+test('launch buttons of an older list have expired', async () => {
+  const { conv, telegram, calls } = criteriaConv()
+  await conv.handleText('/criteria')
+  const old = keyboardOf(telegram.sent.at(-1)).find((b) => b.text === '▶ Build & Verify')
+  await conv.handleText('/criteria')
+  await conv.handleCallback(old.callback_data)
+  assert.equal(calls.launch.length, 0)
+  assert.ok(telegram.sent.at(-1).text.includes('expiré'))
+})
+
+test('a launch while a turn started here runs is queued on OpenFox without a second turn', async () => {
+  const { conv, telegram, calls } = criteriaConv({ rest: { async launchWorkflow(id, l) { calls.launch.push({ id, ...l }); return { status: 'queued' } } } })
+  await conv.handleText('/criteria')
+  const button = keyboardOf(telegram.sent.at(-1)).find((b) => b.text === '▶ Build & Verify')
+  const turn = conv.handleText('encore un détail')
+  await sleep(5)
+  const turnObject = conv._turn
+  await conv.handleCallback(button.callback_data)
+  await sleep(5)
+  assert.equal(calls.launch.length, 1)
+  assert.equal(conv._turn, turnObject, 'the running turn is kept')
+  assert.ok(telegram.sent.at(-1).text.includes('mis en file'))
+  conv.stopTurn()
+  await turn
+})
+
+test('follow: the end of an OpenFox turn offers the build too', async () => {
+  const c = criteriaConv()
+  c.conv.follow = () => true
+  c.conv.syncWatcher()
+  const ev = c.open()[0].onEvent
+  ev({ type: 'chat.delta', payload: { messageId: 'w1', content: 'Plan prêt.' } })
+  ev({ type: 'chat.done', payload: { messageId: 'w1', reason: 'complete' } })
+  await sleep(20)
+  assert.ok(c.telegram.sent.some((m) => m.text.includes('1 critère en attente')), JSON.stringify(c.telegram.sent.map((m) => m.text)))
+})
+
+test('/criteria is a command of the menu, in French and English', () => {
+  assert.ok(BOT_COMMANDS.some((c) => c.command === 'criteria'))
+  assert.ok(BOT_COMMANDS_EN.some((c) => c.command === 'criteria'))
+})
+
+const WAITING_EXEC = {
+  workflowId: 'default',
+  workflowName: 'Build & Verify',
+  status: 'waiting',
+  currentStepId: 'work_location',
+  currentStepName: 'Where to work',
+  stepOutput: { a: '1' },
+  params: {},
+  pendingChoices: [
+    { id: 'Work in current workspace', label: 'Work in current workspace', goto: 'build' },
+    { id: 'Start a new workspace', label: 'Start a new workspace', goto: 'setup_workspace' },
+  ],
+}
+
+test('OpenFoxRestClient.launchWorkflow resumes a paused workflow without a scope, as the web UI does', async () => {
+  const { FakeWS, sockets } = fakeWebSocketClass()
+  const client = new OpenFoxRestClient({ baseUrl: 'http://x', WebSocketImpl: FakeWS })
+  const p = client.launchWorkflow('s1', { workflowId: 'default', resumeFrom: 'work_location', stepOutput: {}, userChoice: 'Start a new workspace' })
+  sockets[0]._emit('open', {})
+  assert.deepEqual(sockets[0].sent[0].payload, { sessionId: 's1', workflowId: 'default', resumeFrom: 'work_location', stepOutput: {}, userChoice: 'Start a new workspace' })
+  sockets[0]._emit('message', { data: JSON.stringify({ type: 'ack', id: sockets[0].sent[0].id }) })
+  assert.deepEqual(await p, { status: 'started' })
+})
+
+test('createWsSubscribe says when the subscription is open', () => {
+  const { FakeWS, sockets } = fakeWebSocketClass()
+  const original = globalThis.WebSocket
+  globalThis.WebSocket = FakeWS
+  try {
+    let opened = 0
+    createWsSubscribe('http://127.0.0.1:10369', noopLogger)('s1', () => {}, { onOpen: () => opened++ })
+    assert.equal(opened, 0)
+    sockets[0]._emit('open', {})
+    assert.equal(opened, 1)
+  } finally {
+    globalThis.WebSocket = original
+  }
+})
+
+test('a workflow paused on a step waiting for the user shows its choices, and a choice resumes it', async () => {
+  const detail = { activeWorkflowExecution: null }
+  const { conv, telegram, calls, subs } = criteriaConv({ detail })
+  await launchFrom(conv, telegram)
+  // The workflow stops at once on its "Where to work" step.
+  detail.activeWorkflowExecution = WAITING_EXEC
+  subs.at(-1).onEvent({ type: 'session.running', payload: { isRunning: false } })
+  await sleep(10)
+  assert.equal(conv.isTurnRunning(), false)
+  const prompt = telegram.sent.at(-1)
+  assert.ok(prompt.text.includes('Build & Verify attend ton choix (Where to work)'), prompt.text)
+  const buttons = keyboardOf(prompt)
+  assert.deepEqual(buttons.map((b) => b.text), ['Work in current workspace', 'Start a new workspace'])
+  assert.ok(!telegram.sent.some((m) => m.text.includes('🏁')), 'not finished')
+  await conv.handleCallback(buttons[1].callback_data)
+  await sleep(5)
+  assert.deepEqual(calls.launch.at(-1), { id: 's1', workflowId: 'default', resumeFrom: 'work_location', stepOutput: { a: '1' }, userChoice: 'Start a new workspace' })
+  assert.ok(telegram.sent.some((m) => m.text.includes('Build & Verify · Start a new workspace reprend')), JSON.stringify(telegram.sent.map((m) => m.text)))
+  assert.equal(conv.isTurnRunning(), true)
+  // The same button again: expired.
+  await conv.handleCallback(buttons[0].callback_data)
+  assert.ok(telegram.sent.at(-1).text.includes('expiré'))
+  conv.stopTurn()
+})
+
+test('a paused workflow without choices offers to continue it', async () => {
+  const { conv, telegram, calls } = criteriaConv({ detail: { activeWorkflowExecution: { ...WAITING_EXEC, pendingChoices: [], currentStepName: 'Review' } } })
+  await conv.handleText('/criteria')
+  const prompt = telegram.sent.at(-1)
+  const [button] = keyboardOf(prompt)
+  assert.equal(button.text, '▶ Continuer Build & Verify (Review)')
+  assert.ok(!keyboardOf(telegram.sent.at(-2)).some((b) => b.text.startsWith('▶ Build')), 'no new launch while one is paused')
+  await conv.handleCallback(button.callback_data)
+  await sleep(5)
+  assert.deepEqual(calls.launch.at(-1), { id: 's1', workflowId: 'default', resumeFrom: 'work_location', stepOutput: { a: '1' } })
+  conv.stopTurn()
+})
+
+test('the end of a turn on a paused workflow offers its choices', async () => {
+  const { conv, telegram, subs } = criteriaConv({ detail: { activeWorkflowExecution: WAITING_EXEC } })
+  const turn = conv.handleText('une question')
+  await sleep(5)
+  subs[0].onEvent({ type: 'chat.delta', payload: { messageId: 'a1', content: 'Réponse.' } })
+  subs[0].onEvent({ type: 'chat.done', payload: { messageId: 'a1', reason: 'complete' } })
+  await turn
+  assert.ok(telegram.sent.at(-1).text.includes('attend ton choix'), telegram.sent.at(-1).text)
+})
+
+test('a workflow whose end was missed ends when OpenFox says it no longer runs, without "expired"', async () => {
+  const timer = fakeTimer()
+  const { conv, telegram } = criteriaConv({ timer })
+  await launchFrom(conv, telegram)
+  assert.equal(conv.isTurnRunning(), true)
+  for (let id = 1; id <= 20; id++) timer._fireTimeout(id)
+  await sleep(10)
+  assert.equal(conv.isTurnRunning(), false)
+  assert.ok(!telegram.sent.some((m) => m.text.includes('expiré')))
+  assert.ok(telegram.sent.at(-1).text.includes('🏁 Build & Verify terminé'), telegram.sent.at(-1).text)
+})
+
+// ---------------------------------------------------------------------------
+// The web UI's "Add criteria" command: the agent adds the criteria it proposed.
+// ---------------------------------------------------------------------------
+
+const ADD_CRITERIA_CMD = { metadata: { id: 'add-criteria', name: 'Add criteria' }, prompt: 'Add the acceptance criteria you proposed using the `session_metadata` tool with the `criteria` key' }
+
+function commandConv({ session = criteriaSession({ mode: 'planner', metadataEntries: {} }), command = ADD_CRITERIA_CMD, rest = {} } = {}) {
+  const sentMessages = []
+  const commands = []
+  const modes = []
+  const c = criteriaConv({
+    session,
+    rest: {
+      async getCommand(id, workdir) { commands.push({ id, workdir }); return command },
+      async sendMessage(id, content, attachments, opts) { sentMessages.push({ id, content, attachments, opts }); return {} },
+      async setSessionMode(id, mode) { modes.push({ id, mode }); session.mode = mode; return session },
+      ...rest,
+    },
+  })
+  return { ...c, sentMessages, commands, modes }
+}
+
+test('OpenFoxRestClient.getCommand reads a command of the workdir; sendMessage can mark a message as a command', async () => {
+  const calls = []
+  const client = new OpenFoxRestClient({ baseUrl: 'http://x', fetchImpl: async (url, opts) => { calls.push([String(url), opts]); return { status: 200, json: async () => ADD_CRITERIA_CMD } } })
+  assert.deepEqual(await client.getCommand('add-criteria', '/home/me/p'), ADD_CRITERIA_CMD)
+  assert.equal(calls[0][0], 'http://x/api/commands/add-criteria?workdir=%2Fhome%2Fme%2Fp')
+  await client.sendMessage('s1', 'go', undefined, { messageKind: 'command' })
+  assert.deepEqual(JSON.parse(calls[1][1].body), { content: 'go', messageKind: 'command' })
+  await client.sendMessage('s1', 'go')
+  assert.deepEqual(JSON.parse(calls[2][1].body), { content: 'go' })
+})
+
+test('/criteria offers the "Add the proposed criteria" button, with or without criteria', async () => {
+  const empty = commandConv()
+  await empty.conv.handleText('/criteria')
+  assert.ok(keyboardOf(empty.telegram.sent.at(-1)).some((b) => b.text === '🤖 Ajouter les critères proposés'))
+  const some = criteriaConv()
+  await some.conv.handleText('/criteria')
+  assert.ok(keyboardOf(some.telegram.sent.at(-1)).some((b) => b.text === '🤖 Ajouter les critères proposés'))
+})
+
+test('the "Add the proposed criteria" button sends the add-criteria command to the agent, then offers the build', async () => {
+  const { conv, telegram, sentMessages, commands, subs, session } = commandConv()
+  await conv.handleText('/criteria')
+  const button = keyboardOf(telegram.sent.at(-1)).find((b) => b.text === '🤖 Ajouter les critères proposés')
+  await conv.handleCallback(button.callback_data)
+  await sleep(5)
+  assert.deepEqual(commands, [{ id: 'add-criteria', workdir: '/w' }])
+  assert.equal(sentMessages.length, 1)
+  assert.equal(sentMessages[0].content, ADD_CRITERIA_CMD.prompt)
+  assert.deepEqual(sentMessages[0].opts, { messageKind: 'command' })
+  assert.equal(conv.isTurnRunning(), true)
+  // The agent adds the criteria, then ends its turn.
+  session.metadataEntries = { criteria: [{ id: '0', description: 'Le script existe', status: 'pending' }] }
+  const ev = subs.at(-1).onEvent
+  ev({ type: 'chat.tool_call', payload: { callId: 'm1', tool: 'session_metadata', args: { action: 'add', key: 'criteria' } } })
+  ev({ type: 'chat.tool_result', payload: { callId: 'm1', result: { success: true } } })
+  ev({ type: 'chat.delta', payload: { messageId: 'a1', content: 'Critères ajoutés.' } })
+  ev({ type: 'chat.done', payload: { messageId: 'a1', reason: 'complete' } })
+  await sleep(10)
+  assert.equal(conv.isTurnRunning(), false)
+  const offer = telegram.sent.at(-1)
+  assert.ok(offer.text.includes('1 critère en attente'), offer.text)
+  assert.ok(keyboardOf(offer).some((b) => b.text === '▶ Build & Verify'))
+})
+
+test('a command with its own agent switches the session to it first, as the web UI does', async () => {
+  const { conv, modes, sentMessages } = commandConv({ command: { metadata: { id: 'add-criteria', name: 'Add criteria', agentMode: 'builder' }, prompt: 'do it' } })
+  await conv.handleCallback('crit:agent')
+  await sleep(5)
+  assert.deepEqual(modes, [{ id: 's1', mode: 'builder' }])
+  assert.equal(sentMessages[0].content, 'do it')
+  conv.stopTurn()
+})
+
+test('the "Add the proposed criteria" button while a turn runs: the command goes to OpenFox\'s queue', async () => {
+  const { conv, telegram, sentMessages } = commandConv()
+  const turn = conv.handleText('dernière précision')
+  await sleep(5)
+  await conv.handleCallback('crit:agent')
+  await sleep(5)
+  assert.equal(sentMessages.length, 2)
+  assert.deepEqual(sentMessages[1].opts, { messageKind: 'command' })
+  assert.equal(conv._turn.queued, 1)
+  assert.ok(telegram.sent.at(-1).text.includes('file'), telegram.sent.at(-1).text)
+  conv.stopTurn()
+  await turn
+})
+
+test('the "Add the proposed criteria" button when OpenFox has no such command says so', async () => {
+  const { conv, telegram, sentMessages } = commandConv({ rest: { async getCommand() { const e = new Error('OpenFox 404: Command not found'); e.status = 404; throw e } } })
+  await conv.handleCallback('crit:agent')
+  await sleep(5)
+  assert.equal(sentMessages.length, 0)
+  assert.ok(telegram.sent.at(-1).text.includes('⚠️'), telegram.sent.at(-1).text)
+})
+
+// ---------------------------------------------------------------------------
+// Buttons of the criteria list: they go away once used, the criteria stay.
+// ---------------------------------------------------------------------------
+
+test('/criteria and the build offer end with a cancel button, which removes nothing but the buttons', async () => {
+  const { conv, telegram } = criteriaConv()
+  await conv.handleText('/criteria')
+  const buttons = keyboardOf(telegram.sent.at(-1))
+  assert.equal(buttons.at(-1).text, '✖ Annuler')
+  const before = telegram.sent.length
+  await conv.handleCallback(buttons.at(-1).callback_data)
+  assert.equal(telegram.sent.length, before, 'no message: the runtime removes the buttons')
+  await conv._offerBuild('s1')
+  assert.equal(keyboardOf(telegram.sent.at(-1)).at(-1).text, '✖ Annuler')
+})
+
+test('a new criteria list removes the buttons of the previous one (they have expired), not its text', async () => {
+  const { conv, telegram } = criteriaConv()
+  await conv.handleText('/criteria')
+  const first = 100 + telegram.sent.length - 1
+  await conv.handleText('/criteria')
+  assert.ok(telegram.edits.some((e) => e.messageId === first && e.markup?.inline_keyboard?.length === 0), JSON.stringify(telegram.edits))
+  assert.ok(!telegram.edits.some((e) => e.text !== undefined), 'the text is not edited')
+})
+
+for (const data of ['crit:close', 'crit:view', 'crit:add', 'crit:agent', 'wfl:1:0', 'wfs:1:0', 'wfg:1:0:0', 'wfc:1:0']) {
+  test(`runtime: a click on ${data} removes the buttons and keeps the message`, async () => {
+    const telegram = fakeTelegram()
+    telegram.removed = []
+    telegram.deleted = []
+    telegram.editMessageReplyMarkup = async (chatId, messageId) => { telegram.removed.push(messageId) }
+    telegram.deleteMessage = async (chatId, messageId) => { telegram.deleted.push(messageId) }
+    const r = createRuntime({ telegram, rest: runtimeRest({ async getSessionDetail() { return { session: { id: 's1' } } } }), subscribe: fakeSubscribe().subscribe, logger: noopLogger, auth: { userId: 42 } })
+    r.start()
+    telegram._push({ update_id: 1, callback_query: { id: 'cb', from: { id: 42 }, message: { message_id: 500, chat: { id: 101, type: 'private' } }, data } })
+    assert.ok(await until(() => telegram.removed.includes(500)), `buttons of ${data} not removed`)
+    r.stop()
+    assert.deepEqual(telegram.deleted, [])
+  })
+}
+
+// ---------------------------------------------------------------------------
+// End of a workflow: OpenFox's summary card (task-completed), not the criteria list.
+// ---------------------------------------------------------------------------
+
+const TASK_DATA = { summary: null, iterations: 9, totalTimeSeconds: 458.2, totalToolCalls: 108, totalTokensGenerated: 37300, avgGenerationSpeed: 160.1, criteria: [], workflowName: 'Build & Verify', workflowId: 'default' }
+const taskCompletedEvent = (data = TASK_DATA) => ({
+  type: 'chat.message',
+  payload: { message: { id: 'tc1', role: 'user', messageKind: 'task-completed', isSystemGenerated: true, content: JSON.stringify(data) } },
+})
+
+test('workflowSummary: the web UI card as a message, in French and English', () => {
+  assert.equal(workflowSummary(TASK_DATA, 'fr'), "🏁 Build & Verify terminé\n9 itérations · 7 min 38 s · 108 appels d'outils · 37,3k tokens · 160,1 tok/s")
+  assert.equal(workflowSummary(TASK_DATA, 'en'), '🏁 Build & Verify finished\n9 iterations · 7m 38s · 108 tool calls · 37.3k tokens · 160.1 tok/s')
+  assert.equal(
+    workflowSummary({ ...TASK_DATA, iterations: 1, totalTimeSeconds: 3725, totalToolCalls: 1, totalTokensGenerated: 2_500_000, avgGenerationSpeed: 0 }, 'fr'),
+    "🏁 Build & Verify terminé\n1 itération · 1 h 2 min 5 s · 1 appel d'outil · 2,5M tokens · — tok/s",
+  )
+  assert.equal(workflowSummary({ ...TASK_DATA, totalTimeSeconds: 42, totalTokensGenerated: 950 }, 'en').split('\n')[1], '9 iterations · 42s · 108 tool calls · 950 tokens · 160.1 tok/s')
+  assert.equal(workflowSummary(null, 'fr', 'Build & Verify'), '🏁 Build & Verify terminé')
+})
+
+test('criteriaCountLine counts the criteria by state, only the states present', () => {
+  const c = (status) => ({ id: status, description: 'x', status })
+  assert.equal(criteriaCountLine([c('passed'), c('done'), c('failed')], 'fr'), '📋 Critères : ✅ 2 validés · ❌ 1 échoué')
+  assert.equal(criteriaCountLine([c('pending'), c('completed'), c('in_progress')], 'en'), '📋 Criteria: ☑️ 1 completed · 🔄 1 in progress · ⏳ 1 pending')
+  assert.equal(criteriaCountLine([], 'fr'), null)
+})
+
+test('the end of a workflow started here: the summary card and the criteria count, without buttons', async () => {
+  const { conv, telegram, subs } = criteriaConv()
+  await launchFrom(conv, telegram)
+  const ev = subs.at(-1).onEvent
+  ev({ type: 'session.running', payload: { isRunning: true } })
+  ev({ type: 'chat.delta', payload: { messageId: 's1', content: 'Résumé de l\'agent.' } })
+  ev({ type: 'chat.done', payload: { messageId: 's1', reason: 'step_done' } })
+  ev(taskCompletedEvent())
+  ev({ type: 'session.running', payload: { isRunning: false } })
+  await sleep(10)
+  const end = telegram.sent.at(-1)
+  assert.equal(end.text, "🏁 Build & Verify terminé\n9 itérations · 7 min 38 s · 108 appels d'outils · 37,3k tokens · 160,1 tok/s\n📋 Critères : ✅ 1 validé · ⏳ 1 en attente")
+  assert.deepEqual(keyboardOf(end), [], 'no buttons under the summary')
+  assert.ok(!telegram.sent.some((m) => m.text.includes('"iterations"')), 'the JSON of the card never reaches Telegram')
+})
+
+test('the end of a workflow with no criterion: the summary alone', async () => {
+  const { conv, telegram, subs } = criteriaConv({ session: criteriaSession({ metadataEntries: {} }), workflows: [BUILD_WF] })
+  conv.state.sessionId = 's1'
+  await conv.startWorkflow('s1', { workflowId: 'default', scope: 'builtin', label: 'Build & Verify' })
+  await sleep(5)
+  const ev = subs.at(-1).onEvent
+  ev(taskCompletedEvent())
+  ev({ type: 'session.running', payload: { isRunning: false } })
+  await sleep(10)
+  assert.equal(telegram.sent.at(-1).text, "🏁 Build & Verify terminé\n9 itérations · 7 min 38 s · 108 appels d'outils · 37,3k tokens · 160,1 tok/s")
+})
+
+test('follow: the summary card of a workflow started from OpenFox is sent too', async () => {
+  const c = criteriaConv()
+  c.conv.follow = () => true
+  c.conv.syncWatcher()
+  const ev = c.open()[0].onEvent
+  ev(taskCompletedEvent())
+  await sleep(20)
+  const summary = c.telegram.sent.find((m) => m.text.startsWith('🏁'))
+  assert.ok(summary, JSON.stringify(c.telegram.sent.map((m) => m.text)))
+  assert.ok(summary.text.includes('9 itérations') && summary.text.includes('📋 Critères : ✅ 1 validé · ⏳ 1 en attente'), summary.text)
+  assert.deepEqual(keyboardOf(summary), [])
+})
+
+test('a task-completed card that cannot be read is ignored', async () => {
+  const c = criteriaConv()
+  c.conv.follow = () => true
+  c.conv.syncWatcher()
+  c.open()[0].onEvent({ type: 'chat.message', payload: { message: { id: 'x', role: 'user', messageKind: 'task-completed', content: '{pas du json' } } })
+  await sleep(10)
+  assert.ok(!c.telegram.sent.some((m) => m.text.startsWith('🏁')))
+})
+
+test('createWsSubscribe forwards only the events of its session (OpenFox sends every session\'s events)', () => {
+  const { FakeWS, sockets } = fakeWebSocketClass()
+  const original = globalThis.WebSocket
+  globalThis.WebSocket = FakeWS
+  try {
+    const got = []
+    createWsSubscribe('http://127.0.0.1:10369', noopLogger)('s1', (m) => got.push(m.payload.content))
+    const ws = sockets[0]
+    ws._emit('message', { data: JSON.stringify({ type: 'chat.delta', sessionId: 's1', payload: { content: 'mine' } }) })
+    ws._emit('message', { data: JSON.stringify({ type: 'chat.delta', sessionId: 'other', payload: { content: 'other session' } }) })
+    ws._emit('message', { data: JSON.stringify({ type: 'chat.delta', payload: { content: 'no session id' } }) })
+    assert.deepEqual(got, ['mine', 'no session id'])
+  } finally {
+    globalThis.WebSocket = original
+  }
+})
+
+test('the end of a workflow: a card that arrives after the end (OpenFox sends the end first) is read from the session', async () => {
+  const detail = { activeWorkflowExecution: null, messages: [] }
+  const { conv, telegram, subs } = criteriaConv({ detail })
+  const old = { id: 'old', role: 'user', messageKind: 'task-completed', timestamp: new Date(Date.now() - 60_000).toISOString(), content: JSON.stringify({ ...TASK_DATA, iterations: 99 }) }
+  detail.messages.push(old)
+  await launchFrom(conv, telegram)
+  detail.messages.push({ id: 'new', role: 'user', messageKind: 'task-completed', timestamp: new Date().toISOString(), content: JSON.stringify(TASK_DATA) })
+  subs.at(-1).onEvent({ type: 'session.running', payload: { isRunning: false } })
+  await sleep(10)
+  const end = telegram.sent.at(-1)
+  assert.ok(end.text.startsWith("🏁 Build & Verify terminé\n9 itérations · 7 min 38 s"), end.text)
+})
+
+test('the end of a workflow: a card from an earlier run is not taken for this one', async () => {
+  const detail = { activeWorkflowExecution: null, messages: [{ id: 'old', role: 'user', messageKind: 'task-completed', timestamp: new Date(Date.now() - 60_000).toISOString(), content: JSON.stringify(TASK_DATA) }] }
+  const { conv, telegram, subs } = criteriaConv({ detail })
+  await launchFrom(conv, telegram)
+  subs.at(-1).onEvent({ type: 'session.running', payload: { isRunning: false } })
+  await sleep(10)
+  assert.ok(telegram.sent.at(-1).text.startsWith('🏁 Build & Verify terminé\n📋'), telegram.sent.at(-1).text)
+})
+
+test('the summary of a resumed workflow is titled with the workflow, not with the choice', async () => {
+  const detail = { activeWorkflowExecution: WAITING_EXEC, messages: [] }
+  const { conv, telegram, subs } = criteriaConv({ detail })
+  await conv.handleText('/criteria')
+  const choice = keyboardOf(telegram.sent.at(-1)).find((b) => b.text === 'Work in current workspace')
+  await conv.handleCallback(choice.callback_data)
+  await sleep(5)
+  assert.ok(telegram.sent.some((m) => m.text.includes('Build & Verify · Work in current workspace reprend')))
+  detail.activeWorkflowExecution = null
+  subs.at(-1).onEvent({ type: 'session.running', payload: { isRunning: false } })
+  await sleep(10)
+  assert.ok(telegram.sent.at(-1).text.startsWith('🏁 Build & Verify terminé'), telegram.sent.at(-1).text)
 })

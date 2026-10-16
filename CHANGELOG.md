@@ -2,6 +2,23 @@
 
 All notable changes to OpenFox Telegram Bridge. Versions follow the `version` field of `package.json`.
 
+## 1.0.6 — 2026-10-16
+
+### Added
+- `/criteria`: the session's acceptance criteria with their state, and ➕ Add to add criteria (one per line).
+- 🤖 Add the proposed criteria (under `/criteria`): runs OpenFox's "Add criteria" command, as the web UI's commands menu does; the agent adds the criteria it proposed, then the build buttons follow.
+- ✖ Cancel under the criteria, the build offer and the steps menu: removes the buttons, the criteria stay. A tapped button goes away too, and a new list removes the expired buttons of the previous one.
+- Build buttons, as in the web UI: while criteria are pending, one ▶ button per workflow (▶ Build & Verify), shown under `/criteria` and at the end of a turn; ⋮ starts a single step. Workflows with parameters stay on the web UI.
+- A workflow started from Telegram is followed through all its steps until it ends. `⏹ stop` stops it.
+- The end of a workflow shows OpenFox's summary, as the web UI's card (iterations, time, tool calls, tokens, speed), with the criteria counted by state; also in follow mode. The list itself stays under `/criteria`.
+- A workflow paused on a step that waits for the user (e.g. "Where to work") shows its choices as buttons; a choice resumes it.
+
+### Fixed
+- Follow mode: Telegram shows "typing…" while a turn started from OpenFox runs, reasoning included, until the turn ends, waits for an answer or fails. It used to show only for turns started from Telegram. It also shows at once when following a session whose turn is already running.
+- A silent turn (a long command, a slow first token) no longer "expires": after 5 minutes without any event, the plugin asks OpenFox whether the turn still runs and keeps waiting (and showing "typing…") while it does. It gives up only when OpenFox says the turn is over or cannot be reached.
+- The agent's reasoning and a command's output count as activity, without their content: neither ever reaches Telegram.
+- Only the active session's events reach Telegram. OpenFox sends every session's events to each connection, and the plugin forwarded them all: with two sessions working at once, the other one's messages could show up.
+
 ## 1.0.5 — 2026-10-13
 
 ### Added

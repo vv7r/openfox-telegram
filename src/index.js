@@ -45,6 +45,7 @@ export const BOT_COMMANDS = [
   { command: 'agents', description: "Changer d'agent, mode nuit" },
   { command: 'status', description: 'État de la session' },
   { command: 'model', description: 'Changer de modèle' },
+  { command: 'criteria', description: 'Critères, lancer le build' },
   { command: 'sessions', description: 'Sessions du projet' },
   { command: 'new', description: 'Nouveau projet' },
   { command: 'new_session', description: 'Nouvelle session' },
@@ -55,6 +56,7 @@ export const BOT_COMMANDS_EN = [
   { command: 'agents', description: 'Switch agent, night mode' },
   { command: 'status', description: 'Session status' },
   { command: 'model', description: 'Switch model' },
+  { command: 'criteria', description: 'Criteria, start the build' },
   { command: 'sessions', description: 'Sessions of the project' },
   { command: 'new', description: 'New project' },
   { command: 'new_session', description: 'New session' },
@@ -152,6 +154,31 @@ const MESSAGES = {
     model_no_match: 'Aucun modèle ne contient « {filter} ».',
     model_closed: 'Choix du modèle fermé.',
     choice_expired: '⚠️ Ce choix a expiré : relance /model.',
+    criteria_header: '📋 Critères de la session',
+    criteria_none: '📋 Aucun critère dans cette session.',
+    criteria_more: '… et {n} autres',
+    btn_criteria_add: '➕ Ajouter',
+    btn_criteria_view: '📋 Voir les critères',
+    btn_criteria_agent: '🤖 Ajouter les critères proposés',
+    btn_criteria_close: '✖ Annuler',
+    command_sent: '🤖 Commande envoyée à l\'agent : {name}.',
+    command_failed: '⚠️ Commande impossible : {err}',
+    criteria_add_prompt: '✏️ Envoie le critère à ajouter (un par ligne pour en ajouter plusieurs). Une commande annule.',
+    criteria_added_one: '✅ 1 critère ajouté.',
+    criteria_added: '✅ {n} critères ajoutés.',
+    criteria_add_failed: '⚠️ Ajout impossible : {err}',
+    build_offer_one: '📋 1 critère en attente : lancer le build ?',
+    build_offer: '📋 {n} critères en attente : lancer le build ?',
+    workflow_params_hidden: 'Les workflows à paramètres se lancent depuis l\'interface web.',
+    workflow_steps: '{name} : le workflow complet, ou une seule de ses étapes ?',
+    btn_workflow_full: 'Workflow complet',
+    workflow_started: '▶ {name} lancé.',
+    workflow_queued: '📥 {name} mis en file : il démarrera après le tour en cours.',
+    workflow_failed: '⚠️ Lancement impossible : {err}',
+    launch_expired: '⚠️ Ce bouton a expiré : relance /criteria.',
+    workflow_resumed: '▶ {name} reprend.',
+    workflow_waiting: '⏸ {name} attend ton choix ({step}) :',
+    btn_workflow_continue: '▶ Continuer {name} ({step})',
     no_models: 'Aucun modèle disponible.',
     creation_cancelled: 'Création annulée.',
     model_set_failed: '⚠️ Le modèle n’a pas pu être défini : {err}',
@@ -247,6 +274,31 @@ const MESSAGES = {
     model_no_match: 'No model contains "{filter}".',
     model_closed: 'Model choice closed.',
     choice_expired: '⚠️ This choice has expired: run /model again.',
+    criteria_header: '📋 Session criteria',
+    criteria_none: '📋 No criteria in this session.',
+    criteria_more: '… and {n} more',
+    btn_criteria_add: '➕ Add',
+    btn_criteria_view: '📋 Show the criteria',
+    btn_criteria_agent: '🤖 Add the proposed criteria',
+    btn_criteria_close: '✖ Cancel',
+    command_sent: '🤖 Command sent to the agent: {name}.',
+    command_failed: '⚠️ Could not run the command: {err}',
+    criteria_add_prompt: '✏️ Send the criterion to add (one per line to add several). A command cancels.',
+    criteria_added_one: '✅ 1 criterion added.',
+    criteria_added: '✅ {n} criteria added.',
+    criteria_add_failed: '⚠️ Could not add: {err}',
+    build_offer_one: '📋 1 pending criterion: start the build?',
+    build_offer: '📋 {n} pending criteria: start the build?',
+    workflow_params_hidden: 'Workflows with parameters are started from the web UI.',
+    workflow_steps: '{name}: the whole workflow, or one of its steps?',
+    btn_workflow_full: 'Whole workflow',
+    workflow_started: '▶ {name} started.',
+    workflow_queued: '📥 {name} queued: it starts after the current turn.',
+    workflow_failed: '⚠️ Could not start: {err}',
+    launch_expired: '⚠️ This button has expired: run /criteria again.',
+    workflow_resumed: '▶ {name} resumes.',
+    workflow_waiting: '⏸ {name} waits for your choice ({step}):',
+    btn_workflow_continue: '▶ Continue {name} ({step})',
     no_models: 'No models available.',
     creation_cancelled: 'Creation cancelled.',
     model_set_failed: '⚠️ The model could not be set: {err}',
@@ -322,6 +374,108 @@ function modelLabel(id) {
   return id.includes('\\') || id.startsWith('/') ? id.split(/[\\/]/).pop() : id
 }
 
+// Criteria as listed in Telegram: an icon per state, long descriptions cut.
+const CRITERION_ICONS = { pending: '⏳', in_progress: '🔄', completed: '☑️', passed: '✅', done: '✅', failed: '❌' }
+const CRITERION_TEXT_MAX = 300
+const CRITERIA_LIST_MAX_CHARS = 3500
+// How long a workflow launch waits for its event subscription to open.
+const WS_READY_WAIT_MS = 2000
+// A workflow's summary card counts as this run's from a little before its launch (clock rounding).
+const CARD_CLOCK_SLACK_MS = 2000
+
+// The end of a workflow, as the web UI's summary card (a "task-completed"
+// message of OpenFox): name, iterations, time, tool calls, tokens, speed.
+const SUMMARY_WORDS = {
+  fr: { over: 'terminé', iteration: ['itération', 'itérations'], toolCall: ["appel d'outil", "appels d'outils"] },
+  en: { over: 'finished', iteration: ['iteration', 'iterations'], toolCall: ['tool call', 'tool calls'] },
+}
+
+function summaryNumber(n, locale, decimals = 1) {
+  const text = Number(n).toFixed(decimals).replace(/\.0+$/, '')
+  return locale === 'en' ? text : text.replace('.', ',')
+}
+
+function summaryTokens(n, locale) {
+  if (n >= 1_000_000) return `${summaryNumber(n / 1_000_000, locale)}M`
+  if (n >= 1_000) return `${summaryNumber(n / 1_000, locale)}k`
+  return String(n)
+}
+
+function summaryTime(seconds, locale) {
+  const total = Math.round(Number(seconds) || 0)
+  const h = Math.floor(total / 3600)
+  const m = Math.floor((total % 3600) / 60)
+  const sec = total % 60
+  const fr = locale !== 'en'
+  if (h > 0) return fr ? `${h} h ${m} min ${sec} s` : `${h}h ${m}m ${sec}s`
+  if (m > 0) return fr ? `${m} min ${sec} s` : `${m}m ${sec}s`
+  return fr ? `${sec} s` : `${sec}s`
+}
+
+/** The summary of a finished workflow; without its card (interrupted run), its name only. */
+export function workflowSummary(data, locale = 'fr', fallbackName = '') {
+  const words = SUMMARY_WORDS[locale] ?? SUMMARY_WORDS.fr
+  const title = `🏁 ${data?.workflowName ?? fallbackName} ${words.over}`
+  if (!data || typeof data !== 'object') return title
+  const count = (n, [one, many]) => `${n} ${n === 1 ? one : many}`
+  const speed = data.avgGenerationSpeed > 0 ? summaryNumber(data.avgGenerationSpeed, locale) : '—'
+  const stats = [
+    count(data.iterations ?? 0, words.iteration),
+    summaryTime(data.totalTimeSeconds, locale),
+    count(data.totalToolCalls ?? 0, words.toolCall),
+    `${summaryTokens(data.totalTokensGenerated ?? 0, locale)} tokens`,
+    `${speed} tok/s`,
+  ]
+  return `${title}\n${stats.join(' · ')}`
+}
+
+// The criteria by state, as one line (the list itself is /criteria).
+const CRITERIA_COUNT = {
+  fr: {
+    label: '📋 Critères : ',
+    states: [
+      [['passed', 'done'], '✅', ['validé', 'validés']],
+      [['completed'], '☑️', ['fait', 'faits']],
+      [['in_progress'], '🔄', ['en cours', 'en cours']],
+      [['pending'], '⏳', ['en attente', 'en attente']],
+      [['failed'], '❌', ['échoué', 'échoués']],
+    ],
+  },
+  en: {
+    label: '📋 Criteria: ',
+    states: [
+      [['passed', 'done'], '✅', ['passed', 'passed']],
+      [['completed'], '☑️', ['completed', 'completed']],
+      [['in_progress'], '🔄', ['in progress', 'in progress']],
+      [['pending'], '⏳', ['pending', 'pending']],
+      [['failed'], '❌', ['failed', 'failed']],
+    ],
+  },
+}
+
+export function criteriaCountLine(criteria, locale = 'fr') {
+  if (!criteria?.length) return null
+  const { label, states } = CRITERIA_COUNT[locale] ?? CRITERIA_COUNT.fr
+  const parts = []
+  for (const [statuses, icon, [one, many]] of states) {
+    const n = criteria.filter((c) => statuses.includes(c.status)).length
+    if (n > 0) parts.push(`${icon} ${n} ${n === 1 ? one : many}`)
+  }
+  return parts.length ? label + parts.join(' · ') : null
+}
+
+/** The card of a finished workflow in a chat.message, or null. */
+function taskCompletedOf(payload) {
+  const m = payload?.message
+  if (m?.messageKind !== 'task-completed' || typeof m.content !== 'string') return null
+  try {
+    const data = JSON.parse(m.content)
+    return data && typeof data === 'object' ? data : null
+  } catch {
+    return null
+  }
+}
+
 // Agents offered by the agents key, in this order.
 const SELECTABLE_AGENTS = ['builder', 'planner']
 
@@ -362,7 +516,8 @@ function isCommand(t) {
     t.startsWith('/continue ') ||
     t === '/agents' ||
     t === '/status' ||
-    t === '/model'
+    t === '/model' ||
+    t === '/criteria'
   )
 }
 
@@ -517,10 +672,11 @@ export function toAttachment({ bytes, filename, mimeType }) {
 // OpenFoxRestClient — thin fetch wrapper over the OpenFox HTTP API.
 // ---------------------------------------------------------------------------
 export class OpenFoxRestClient {
-  constructor({ baseUrl, fetchImpl, requestTimeoutMs } = {}) {
+  constructor({ baseUrl, fetchImpl, requestTimeoutMs, WebSocketImpl } = {}) {
     this.baseUrl = (baseUrl ?? DEFAULT_BASE_URL).replace(/\/$/, '')
     this.fetch = fetchImpl ?? fetch
     this.requestTimeoutMs = requestTimeoutMs ?? REQUEST_TIMEOUT_MS
+    this.WebSocketImpl = WebSocketImpl ?? null
   }
 
   async _request(path, { method = 'GET', body } = {}) {
@@ -560,11 +716,18 @@ export class OpenFoxRestClient {
     return (await this._request('/api/sessions', { method: 'POST', body: { projectId, title } })).session
   }
 
-  async sendMessage(sessionId, content, attachments) {
+  // messageKind 'command': a command of OpenFox (e.g. "Add criteria"), as the web UI sends it.
+  async sendMessage(sessionId, content, attachments, { messageKind } = {}) {
     return this._request(`/api/sessions/${encodeURIComponent(sessionId)}/message`, {
       method: 'POST',
-      body: attachments?.length ? { content, attachments } : { content },
+      body: { content, ...(attachments?.length ? { attachments } : {}), ...(messageKind ? { messageKind } : {}) },
     })
+  }
+
+  /** A command of OpenFox ({ metadata: { id, name, agentMode? }, prompt }), with the workdir's own version if it has one. */
+  async getCommand(commandId, workdir) {
+    const query = workdir ? `?workdir=${encodeURIComponent(workdir)}` : ''
+    return this._request(`/api/commands/${encodeURIComponent(commandId)}${query}`)
   }
 
   // Stop the agent working on a session (what the web UI's stop button does).
@@ -640,6 +803,82 @@ export class OpenFoxRestClient {
       method: 'POST',
       body: { providerId, model },
     })).session
+  }
+
+  /** The workflows of a workdir: built-in, then the user's, then the project's (as the web UI lists them). */
+  async listWorkflows(workdir) {
+    const data = await this._request(workdir ? `/api/workflows?workdir=${encodeURIComponent(workdir)}` : '/api/workflows')
+    return [...(data.defaults ?? []), ...(data.userItems ?? []), ...(data.projectItems ?? [])]
+  }
+
+  /** Replace the session's criteria (the whole list, as the web UI does). */
+  async setCriteria(sessionId, criteria) {
+    return this._request(`/api/sessions/${encodeURIComponent(sessionId)}/criteria`, {
+      method: 'PUT',
+      body: { criteria },
+    })
+  }
+
+  /**
+   * Start a workflow on a session, like the web UI's "▶ Build & Verify". OpenFox
+   * has no HTTP route for it: `runner.launch` goes over a short-lived WebSocket
+   * (closing it does not stop the workflow). Resolves { status: 'started' } on
+   * the ack, { status: 'queued' } when the agent works (OpenFox queues it).
+   * With resumeFrom (and stepOutput, params, userChoice), it continues a
+   * workflow paused on a step that waits for the user.
+   */
+  launchWorkflow(sessionId, { workflowId, subGroup, scope, ...resume } = {}) {
+    const WS = this.WebSocketImpl ?? globalThis.WebSocket
+    const id = `telegram-launch-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
+    return new Promise((resolve, reject) => {
+      let ws
+      let settled = false
+      const settle = (fn, value) => {
+        if (settled) return
+        settled = true
+        clearTimeout(timer)
+        try {
+          ws?.close()
+        } catch {}
+        fn(value)
+      }
+      const timer = setTimeout(() => settle(reject, new Error('OpenFox: no answer to the workflow launch')), this.requestTimeoutMs)
+      try {
+        ws = new WS(wsUrl(this.baseUrl))
+      } catch (e) {
+        return settle(reject, e)
+      }
+      ws.addEventListener('open', () => {
+        // A resume (resumeFrom, stepOutput, params, userChoice) carries no scope, as in the web UI.
+        const payload = {
+          sessionId,
+          ...(workflowId ? { workflowId } : {}),
+          ...(subGroup ? { subGroup } : {}),
+          ...resume,
+          ...(resume.resumeFrom ? {} : { scope: scope ?? 'auto' }),
+        }
+        try {
+          ws.send(JSON.stringify({ id, type: 'runner.launch', payload }))
+        } catch (e) {
+          settle(reject, e)
+        }
+      })
+      ws.addEventListener('message', (ev) => {
+        let msg
+        try {
+          msg = JSON.parse(ev.data)
+        } catch {
+          return
+        }
+        if (msg?.id !== id) return
+        if (msg.type === 'ack') settle(resolve, { status: 'started' })
+        else if (msg.type === 'queue.state') settle(resolve, { status: 'queued' })
+        else if (msg.type === 'error') settle(reject, new Error(msg.payload?.message ?? 'workflow launch refused'))
+      })
+      const dropped = () => settle(reject, new Error('OpenFox: connection closed before the workflow launch was confirmed'))
+      ws.addEventListener('close', dropped)
+      ws.addEventListener('error', dropped)
+    })
   }
 }
 
@@ -866,16 +1105,55 @@ export class Conversation {
     }
   }
 
-  startTyping() {
-    // Send an indicator immediately so "typing" is visible from the start of the
-    // turn, then keep it alive on an interval until the turn completes.
+  /** Whether OpenFox says a turn runs on the session (false when it cannot tell). */
+  async _stillRunning(sessionId) {
+    if (!this.rest.getSessionDetail) return false
+    try {
+      return Boolean((await this.rest.getSessionDetail(sessionId))?.session?.isRunning)
+    } catch {
+      return false
+    }
+  }
+
+  /** "Typing…" shown at once, then kept alive until the returned stop() is called. */
+  _typingLoop() {
     void this._sendTyping('immediate')
     const id = this._setInterval(() => {
       void this._sendTyping('tick')
     }, this.typingIntervalMs)
-    const stop = () => this._clearInterval(id)
+    return () => this._clearInterval(id)
+  }
+
+  startTyping() {
+    // The indicator of a turn started here, until the turn completes.
+    const stop = this._typingLoop()
     this._stopTyping = stop
     return stop
+  }
+
+  /**
+   * "Typing…" for a turn started from OpenFox (follow mode), separate from the
+   * one of a turn started here. It stops on its own after a silence as long as
+   * a turn's watchdog, so a missed end never leaves it running.
+   */
+  _watcherTyping(watcher, on) {
+    const gen = (watcher.typingGen = (watcher.typingGen ?? 0) + 1)
+    if (on) {
+      if (!watcher.stopTyping) watcher.stopTyping = this._typingLoop()
+      this._clearTimeout(watcher.typingTimeout)
+      // After a silence, OpenFox says whether the turn still runs.
+      watcher.typingTimeout = this._setTimeout(() => {
+        void this._stillRunning(watcher.sessionId).then((running) => {
+          if (watcher.typingGen !== gen || !watcher.stopTyping) return
+          this._watcherTyping(watcher, running && watcher.alive)
+        })
+      }, this.turnTimeoutMs)
+      return
+    }
+    watcher.stopTyping?.()
+    watcher.stopTyping = null
+    this._clearTimeout(watcher.typingTimeout)
+    watcher.typingTimeout = null
   }
 
   abort() {
@@ -902,8 +1180,13 @@ export class Conversation {
    * text, accumulate the assistant's `chat.delta` (never `chat.thinking` nor
    * tool events), show a typing indicator while it runs, and forward the
    * final text on `chat.done`. Resolves when the turn completes.
+   *
+   * With `launch` ({ workflowId, subGroup, scope, name }), the turn is a
+   * workflow started like the web UI's "▶ Build & Verify": each of its steps
+   * ends with a chat.done ("step_done"), so the workflow ends when OpenFox
+   * says the session no longer runs.
    */
-  async runTurn(sessionId, content, attachments) {
+  async runTurn(sessionId, content, attachments, { launch = null, messageKind = null } = {}) {
     this.logger.debug('telegram: turn start', { sessionId })
     this._saveState()
     const deltas = new Map()
@@ -990,6 +1273,15 @@ export class Conversation {
       enqueue(() => this.sendTurnEnd('', turnChanges))
     }
     let finished = false
+    // How the turn ended: 'done' when OpenFox ended it (not /stop, a time-out or a failure).
+    let endedBy = null
+    // A workflow: whether it was seen running (a "not running" state from
+    // before its start must not end it).
+    let sawRunning = false
+    // The summary card of the workflow (its task-completed message).
+    let taskCompleted = null
+    // When the workflow was started: its card is the first one after.
+    let launchedAt = Date.now()
     // An auto-compaction emits a `chat.message` (isCompactionSummary) followed by a
     // `chat.done` ("complete") for the compaction turn, then the agent continues and
     // emits the real answer. The summary id consumes that compaction done so it does
@@ -1004,15 +1296,26 @@ export class Conversation {
     // fail the turn gracefully instead of spinning the typing indicator forever.
     // It restarts on every event, so it measures inactivity, not the turn's
     // length, and never expires while a question waits for the user's answer.
+    // A silence is not the end of the turn (a long command, a slow first
+    // token): OpenFox is asked whether the turn still runs before giving up.
     let timeoutId
+    let watchdogGen = 0
     const armWatchdog = () => {
       this._clearTimeout(timeoutId)
+      const gen = ++watchdogGen
       timeoutId = this._setTimeout(() => {
         if (finished) return
         if (this.hasPendingQuestion()) return armWatchdog()
-        this.logger.warn('telegram: turn timed out', { sessionId, timeoutMs: this.turnTimeoutMs })
-        void this.telegram.sendMessage(this.chatId, this.t('turn_timeout'))
-        finish()
+        void this._stillRunning(sessionId).then((running) => {
+          // Activity came back while OpenFox was asked: the watchdog was re-armed.
+          if (finished || gen !== watchdogGen) return
+          if (running) return armWatchdog()
+          // A workflow whose end was missed (it can stop within a second, e.g. on a step waiting for the user).
+          if (launch) return finish('done')
+          this.logger.warn('telegram: turn timed out', { sessionId, timeoutMs: this.turnTimeoutMs })
+          void this.telegram.sendMessage(this.chatId, this.t('turn_timeout'))
+          finish('timeout')
+        })
       }, this.turnTimeoutMs)
     }
     armWatchdog()
@@ -1022,9 +1325,10 @@ export class Conversation {
     // are forwarded by this turn too.
     const turn = { sessionId, queued: 0 }
     let cleanup = null
-    const finish = () => {
+    const finish = (reason = 'aborted') => {
       if (finished) return
       finished = true
+      endedBy = reason
       stopTyping()
       this._clearTimeout(timeoutId)
       // The questions of this turn can no longer be answered.
@@ -1054,16 +1358,29 @@ export class Conversation {
     this._turnSessionId = sessionId
     this._turn = turn
 
+    // A workflow is launched once the subscription is open, or it could end
+    // (within a second) before its events are followed.
+    let resolveReady
+    const ready = new Promise((resolve) => {
+      resolveReady = resolve
+    })
     cleanup = this.subscribe(sessionId, (msg) => {
       if (finished) return
       this._markSeen(msg.payload)
       armWatchdog()
+      if (msg.type === 'session.running') {
+        if (msg.payload?.isRunning) sawRunning = true
+        else if (launch && sawRunning) finish('done')
+        return
+      }
+      if (msg.type !== 'chat.thinking') sawRunning = true
       if (msg.type === 'chat.delta') {
         if (msg.payload?.subAgentType) return
         const id = msg.payload.messageId
         deltas.set(id, (deltas.get(id) ?? '') + msg.payload.content)
       } else if (msg.type === 'chat.message') {
         const m = msg.payload?.message
+        taskCompleted = taskCompletedOf(msg.payload) ?? taskCompleted
         if (m?.isCompactionSummary && !m.subAgentType) compactionSummaryId = m.id
         if (m?.role === 'assistant' && typeof m.content === 'string') {
           fallback.set(m.id ?? 'm', m.content)
@@ -1127,20 +1444,40 @@ export class Conversation {
           return
         }
         endSegment(msg.payload.messageId)
-        finish()
+        // A workflow goes on with its next step: it ends when the session stops running.
+        if (launch) return
+        finish('done')
       } else if (msg.type === 'chat.error') {
         const error = msg.payload?.error ?? 'error'
         enqueue(() => this.telegram.sendMessage(this.chatId, `⚠️ ${error}`))
-        finish()
+        if (!launch) finish('error')
       }
       // chat.thinking is intentionally ignored.
-    })
+    }, { onOpen: () => resolveReady() })
 
     // Ended while subscribing: close the subscription just returned.
     if (finished) cleanup?.()
 
     try {
-      await this.rest.sendMessage(sessionId, content, attachments)
+      if (launch) {
+        const { label, name, ...request } = launch
+        launchedAt = Date.now()
+        let readyTimer
+        await Promise.race([ready, new Promise((resolve) => (readyTimer = setTimeout(resolve, WS_READY_WAIT_MS)))])
+        clearTimeout(readyTimer)
+        const started = await this.rest.launchWorkflow(sessionId, request)
+        // The agent works: OpenFox runs the workflow after the current turn.
+        if (started?.status === 'queued') {
+          enqueue(() => this.telegram.sendMessage(this.chatId, this.t('workflow_queued', { name: label })))
+          finish('queued')
+        } else {
+          // OpenFox acknowledges once the workflow is set to run: a "not running" state from now on is its end.
+          sawRunning = true
+          enqueue(() => this.telegram.sendMessage(this.chatId, this.t(request.resumeFrom ? 'workflow_resumed' : 'workflow_started', { name: label })))
+        }
+      } else {
+        await this.rest.sendMessage(sessionId, content, attachments, ...(messageKind ? [{ messageKind }] : []))
+      }
       await done
     } finally {
       finish()
@@ -1151,6 +1488,10 @@ export class Conversation {
         await last
       } while (last !== out)
     }
+    // Like the web UI under the conversation: the criteria after a workflow,
+    // the build buttons after a turn that left criteria to do.
+    if (endedBy === 'done' && launch) await this._afterWorkflow(sessionId, launch.name ?? launch.label, taskCompleted, launchedAt)
+    else if (endedBy === 'done') await this._offerBuild(sessionId)
   }
 
   /** Whether the buttons of this message were already removed (and forget it). */
@@ -1261,15 +1602,24 @@ export class Conversation {
       sentIds: new Set(),
       headerSent: false,
       compactionDonePending: false,
+      stopTyping: null,
+      typingTimeout: null,
       out: Promise.resolve(),
       close: null,
     }
     watcher.close = this.subscribe(sessionId, (msg) => this._onWatchedEvent(watcher, msg), {
       onClose: () => {
         watcher.alive = false
+        this._watcherTyping(watcher, false)
       },
     })
     this._watcher = watcher
+    // Following a session whose turn already runs (plugin restarted mid-turn).
+    void Promise.resolve(this.rest.getSessionDetail?.(sessionId))
+      .then((detail) => {
+        if (detail?.session?.isRunning && watcher.alive && this._watcher === watcher && !this._turn) this._watcherTyping(watcher, true)
+      })
+      .catch(() => {})
   }
 
   closeWatcher() {
@@ -1277,6 +1627,7 @@ export class Conversation {
     this._watcher = null
     if (!w) return
     w.alive = false
+    this._watcherTyping(w, false)
     try {
       w.close?.()
     } catch {}
@@ -1284,11 +1635,20 @@ export class Conversation {
 
   _onWatchedEvent(watcher, msg) {
     if (!watcher.alive || this._watcher !== watcher || !this._followOn()) return
-    // A turn started here forwards its own events.
-    if (this._turn) return
+    // A turn started here forwards its own events and shows its own "typing…".
+    if (this._turn) {
+      this._watcherTyping(watcher, false)
+      return
+    }
     const p = msg.payload ?? {}
     if ((p.messageId && this._seen.has(p.messageId)) || (p.callId && this._seen.has(p.callId))) return
     const sessionId = watcher.sessionId
+    // "Typing…" while the OpenFox turn runs: from its start (or any sign of
+    // work, e.g. the reasoning) to its end, a wait for the user or an error.
+    if (msg.type === 'session.running') return this._watcherTyping(watcher, Boolean(p.isRunning))
+    if (msg.type === 'chat.thinking') return this._watcherTyping(watcher, true)
+    if (msg.type === 'chat.error' || (msg.type === 'chat.done' && p.agentType !== 'sub-agent')) this._watcherTyping(watcher, false)
+    else if (['chat.delta', 'chat.tool_call', 'chat.tool_result', 'chat.tool_output'].includes(msg.type)) this._watcherTyping(watcher, true)
     // An OpenFox turn is running until its end (or an error).
     if (msg.type === 'chat.done' && p.agentType !== 'sub-agent' && p.reason !== 'waiting_for_user') watcher.busy = false
     else if (msg.type === 'chat.error') watcher.busy = false
@@ -1298,6 +1658,18 @@ export class Conversation {
       watcher.deltas.set(p.messageId, (watcher.deltas.get(p.messageId) ?? '') + (p.content ?? ''))
     } else if (msg.type === 'chat.message') {
       const m = p.message
+      const card = taskCompletedOf(p)
+      if (card) {
+        watcher.out = watcher.out
+          .then(async () => {
+            let detail = null
+            try {
+              detail = await this.rest.getSessionDetail(sessionId)
+            } catch {}
+            await this._sendWorkflowSummary(card, detail)
+          })
+          .catch(() => {})
+      }
       if (m?.isCompactionSummary && !m.subAgentType) watcher.compactionDonePending = true
       if (m?.role === 'assistant' && typeof m.content === 'string') watcher.fallback.set(m.id ?? 'm', m.content)
     } else if (msg.type === 'chat.message_updated') {
@@ -1341,7 +1713,10 @@ export class Conversation {
       watcher.headerSent = false
       watcher.deltas.clear()
       watcher.fallback.clear()
-      watcher.out = watcher.out.then(() => this.sendTurnEnd('', changes)).catch(() => {})
+      watcher.out = watcher.out
+        .then(() => this.sendTurnEnd('', changes))
+        .then(() => this._offerBuild(sessionId))
+        .catch(() => {})
     } else if (msg.type === 'chat.error') {
       void this.telegram.sendMessage(this.chatId, `⚠️ ${p.error ?? 'error'}`)
     }
@@ -1456,11 +1831,11 @@ export class Conversation {
   }
 
   /** Send a message while the agent works: OpenFox queues it, the running turn forwards its answer. */
-  async queueText(text, attachments) {
+  async queueText(text, attachments, { messageKind = null } = {}) {
     const turn = this._turn
     turn.queued++
     try {
-      await this.rest.sendMessage(turn.sessionId, text, attachments)
+      await this.rest.sendMessage(turn.sessionId, text, attachments, ...(messageKind ? [{ messageKind }] : []))
     } catch (e) {
       turn.queued--
       return this.telegram.sendMessage(this.chatId, `⚠️ ${e?.message ?? 'error'}`)
@@ -1494,9 +1869,9 @@ export class Conversation {
     }
   }
 
-  async queueOnWatched(text, attachments) {
+  async queueOnWatched(text, attachments, { messageKind = null } = {}) {
     try {
-      await this.rest.sendMessage(this.state.sessionId, text, attachments)
+      await this.rest.sendMessage(this.state.sessionId, text, attachments, ...(messageKind ? [{ messageKind }] : []))
     } catch (e) {
       return this.telegram.sendMessage(this.chatId, `⚠️ ${e?.message ?? 'error'}`)
     }
@@ -1548,6 +1923,15 @@ export class Conversation {
     if (!typed) return
     // A reply-keyboard key is its slash command.
     const t = KEYBOARD_COMMANDS[typed] ?? typed
+    // The text asked for by "➕ Add": the criteria (a command cancels).
+    if (this._criteriaInput) {
+      const input = this._criteriaInput
+      this._criteriaInput = null
+      if (!isCommand(t)) {
+        await this._ensureLocale()
+        return this.addCriteria(input.sessionId, t)
+      }
+    }
     if (this.hasPendingQuestion() && !isCommand(t)) return this.answerPendingQuestion(t, undefined, { typed: true })
     await this._ensureLocale()
 
@@ -1625,6 +2009,7 @@ export class Conversation {
     }
     if (t === '/agents') return this.showAgents()
     if (t === '/status') return this.showStatus()
+    if (t === '/criteria') return this.showCriteria()
     if (t === '/model') {
       if (!this.state.sessionId) {
         return this.telegram.sendMessage(this.chatId, this.t('no_active_session'), { reply_markup: menuKeyboard({ session: false }) })
@@ -2100,6 +2485,292 @@ export class Conversation {
     return this.telegram.sendMessage(this.chatId, this.t(picker.purpose === 'create' ? 'creation_cancelled' : 'model_closed'))
   }
 
+  // --- criteria and workflows (the web UI's criteria sidebar and "▶ Build & Verify") ---
+  // Launch buttons carry their list's generation and an index (a workflow id
+  // may not fit in 64 bytes); a new list expires the buttons of the older ones.
+
+  /** The criteria to do when the web UI would offer the build: pending ones, outside a finished session or a running workflow. */
+  _pendingForBuild(detail) {
+    const session = detail?.session
+    if (!session || session.phase === 'done') return []
+    const status = detail.activeWorkflowExecution?.status
+    if (status === 'running' || status === 'waiting') return []
+    return (session.metadataEntries?.criteria ?? []).filter((c) => c.status === 'pending')
+  }
+
+  /** One launch button per workflow; a workflow with parameters needs the web UI's form. */
+  async _launchRows(sessionId, detail) {
+    let workflows = []
+    try {
+      workflows = (await this.rest.listWorkflows?.(detail?.session?.workdir)) ?? []
+    } catch (e) {
+      this.logger.warn('telegram: could not list the workflows', { sessionId, error: e?.message })
+      return { rows: [], hidden: false }
+    }
+    const needsParams = (w) => (w.parameters ?? []).some((p) => p.required || p.position !== undefined)
+    const launchable = workflows.filter((w) => !needsParams(w))
+    const gen = (this._launchSeq = (this._launchSeq ?? 0) + 1)
+    this._launchMenu = { gen, sessionId, workflows: launchable }
+    const rows = launchable.map((w, i) => {
+      const row = [{ text: `▶ ${w.name ?? w.id}`, callback_data: `wfl:${gen}:${i}` }]
+      if (w.subGroups?.length) row.push({ text: '⋮', callback_data: `wfs:${gen}:${i}` })
+      return row
+    })
+    return { rows, hidden: launchable.length < workflows.length }
+  }
+
+  /** The criteria as lines: an icon per state, within one Telegram message. */
+  _criteriaLines(criteria) {
+    const lines = []
+    let length = 0
+    for (const [i, c] of criteria.entries()) {
+      let text = String(c.description ?? '').trim()
+      if (text.length > CRITERION_TEXT_MAX) text = `${text.slice(0, CRITERION_TEXT_MAX)}…`
+      const line = `${CRITERION_ICONS[c.status] ?? '•'} ${text}`
+      if (length + line.length > CRITERIA_LIST_MAX_CHARS) {
+        lines.push(this.t('criteria_more', { n: criteria.length - i }))
+        break
+      }
+      lines.push(line)
+      length += line.length + 1
+    }
+    return lines
+  }
+
+  /** /criteria: the session's criteria, an add button, the launch buttons while criteria are pending, the choices of a paused workflow. */
+  async showCriteria(sessionId = this.state.sessionId) {
+    if (!sessionId) {
+      return this.telegram.sendMessage(this.chatId, this.t('no_active_session'), { reply_markup: menuKeyboard({ session: false }) })
+    }
+    let detail
+    try {
+      detail = await this.rest.getSessionDetail(sessionId)
+    } catch (e) {
+      return this.telegram.sendMessage(this.chatId, this.t('status_unreadable', { err: e?.message ?? 'error' }))
+    }
+    const criteria = detail?.session?.metadataEntries?.criteria ?? []
+    const lines = []
+    if (criteria.length === 0) lines.push(this.t('criteria_none'))
+    else lines.push(this.t('criteria_header'), ...this._criteriaLines(criteria))
+    const rows = [
+      [{ text: this.t('btn_criteria_add'), callback_data: 'crit:add' }],
+      [{ text: this.t('btn_criteria_agent'), callback_data: 'crit:agent' }],
+    ]
+    if (this._pendingForBuild(detail).length > 0) {
+      const { rows: launch, hidden } = await this._launchRows(sessionId, detail)
+      rows.push(...launch)
+      if (hidden) lines.push('', this.t('workflow_params_hidden'))
+    }
+    rows.push([{ text: this.t('btn_criteria_close'), callback_data: 'crit:close' }])
+    const sent = await this._sendCriteriaMessage(lines.join('\n'), rows)
+    // A workflow paused on a step waiting for the user: its choices follow.
+    if (this._waitingWorkflow(detail)) await this._offerContinue(sessionId, detail)
+    return sent
+  }
+
+  /**
+   * A criteria list or build offer. Its buttons replace those of the previous
+   * one, which are removed (they have expired); the text of the old one stays.
+   */
+  async _sendCriteriaMessage(text, rows) {
+    const old = this._criteriaMessageId
+    this._criteriaMessageId = null
+    if (old != null) {
+      try {
+        await this.telegram.editMessageReplyMarkup?.(this.chatId, old, { inline_keyboard: [] })
+      } catch {}
+    }
+    const sent = await this.telegram.sendMessage(this.chatId, text, { reply_markup: { inline_keyboard: rows } })
+    this._criteriaMessageId = sent?.message_id ?? null
+    return sent
+  }
+
+  /** After a turn, as the web UI shows under the conversation: the build buttons while criteria are pending. */
+  async _offerBuild(sessionId) {
+    if (sessionId !== this.state.sessionId || !this.rest.getSessionDetail) return
+    try {
+      const detail = await this.rest.getSessionDetail(sessionId)
+      if (this._waitingWorkflow(detail)) return await this._offerContinue(sessionId, detail)
+      const pending = this._pendingForBuild(detail)
+      if (pending.length === 0) return
+      const { rows } = await this._launchRows(sessionId, detail)
+      if (rows.length === 0) return
+      const text = pending.length === 1 ? this.t('build_offer_one') : this.t('build_offer', { n: pending.length })
+      const view = [{ text: this.t('btn_criteria_view'), callback_data: 'crit:view' }]
+      const close = [{ text: this.t('btn_criteria_close'), callback_data: 'crit:close' }]
+      await this._sendCriteriaMessage(text, [view, ...rows, close])
+    } catch (e) {
+      this.logger.warn('telegram: build offer failed', { sessionId, error: e?.message })
+    }
+  }
+
+  /** Add criteria, one per line, numbered after the highest id (as the web UI does), then show the list. */
+  async addCriteria(sessionId, text) {
+    const added = text.split('\n').map((line) => line.trim()).filter(Boolean)
+    if (added.length === 0) return
+    try {
+      const detail = await this.rest.getSessionDetail(sessionId)
+      const current = (detail?.session?.metadataEntries?.criteria ?? []).map((c) => ({ ...c, id: String(c.id) }))
+      const ids = current.map((c) => Number(c.id)).filter((n) => Number.isInteger(n) && n >= 0)
+      const first = Math.max(-1, ...ids) + 1
+      const fresh = added.map((description, i) => ({ id: String(first + i), description, status: 'pending' }))
+      await this.rest.setCriteria(sessionId, [...current, ...fresh])
+    } catch (e) {
+      return this.telegram.sendMessage(this.chatId, this.t('criteria_add_failed', { err: e?.message ?? 'error' }))
+    }
+    await this.telegram.sendMessage(this.chatId, added.length === 1 ? this.t('criteria_added_one') : this.t('criteria_added', { n: added.length }))
+    return this.showCriteria(sessionId)
+  }
+
+  /** The workflow paused on a step that waits for the user, while the agent does not run. */
+  _waitingWorkflow(detail) {
+    const exec = detail?.activeWorkflowExecution
+    return exec?.status === 'waiting' && !detail?.session?.isRunning ? exec : null
+  }
+
+  /** The web UI's "Continue" buttons: one per choice of the paused step, or one to continue. */
+  async _offerContinue(sessionId, detail) {
+    const exec = this._waitingWorkflow(detail)
+    if (!exec) return
+    const gen = (this._launchSeq = (this._launchSeq ?? 0) + 1)
+    this._continueMenu = { gen, sessionId, exec }
+    const name = exec.workflowName ?? exec.workflowId
+    const step = exec.currentStepName ?? exec.currentStepId ?? '…'
+    const choices = exec.pendingChoices ?? []
+    const rows = choices.length
+      ? choices.map((c, i) => [{ text: c.label ?? c.id, callback_data: `wfc:${gen}:${i}` }])
+      : [[{ text: this.t('btn_workflow_continue', { name, step }), callback_data: `wfc:${gen}:-` }]]
+    return this.telegram.sendMessage(this.chatId, this.t('workflow_waiting', { name, step }), { reply_markup: { inline_keyboard: rows } })
+  }
+
+  /** The end of a workflow run: its paused step's choices, or its summary (as the web UI's card). */
+  async _afterWorkflow(sessionId, name, taskCompleted, launchedAt = 0) {
+    let detail = null
+    try {
+      detail = await this.rest.getSessionDetail(sessionId)
+    } catch {}
+    if (this._waitingWorkflow(detail)) return this._offerContinue(sessionId, detail)
+    // OpenFox says the session stopped running before its card reaches the
+    // WebSocket: the card is read from the session, where it already is
+    // (a card from before this launch belongs to an earlier run).
+    const card =
+      taskCompleted ??
+      (detail?.messages ?? [])
+        .filter((m) => m?.messageKind === 'task-completed' && Date.parse(m.timestamp) >= launchedAt - CARD_CLOCK_SLACK_MS)
+        .map((m) => taskCompletedOf({ message: m }))
+        .filter(Boolean)
+        .at(-1) ??
+      null
+    return this._sendWorkflowSummary(card, detail, name)
+  }
+
+  /** The summary of a finished workflow and the count of its criteria, without buttons (the list is /criteria). */
+  async _sendWorkflowSummary(taskCompleted, detail, label = '') {
+    const locale = this._locale ?? 'fr'
+    const lines = [workflowSummary(taskCompleted, locale, label)]
+    const count = criteriaCountLine(detail?.session?.metadataEntries?.criteria, locale)
+    if (count) lines.push(count)
+    try {
+      await this.telegram.sendMessage(this.chatId, lines.join('\n'))
+    } catch (e) {
+      this.logger.warn('telegram: workflow summary failed', { error: e?.message })
+    }
+  }
+
+  /** A "Continue" button: resume the paused workflow (with the chosen branch), as the web UI does. */
+  async _onContinueCallback(data) {
+    const [, gen, index] = data.split(':')
+    const menu = this._continueMenu
+    const exec = menu && String(menu.gen) === gen ? menu.exec : null
+    const choice = exec && index !== '-' ? exec.pendingChoices?.[Number(index)] : null
+    if (!exec || (index !== '-' && !choice)) return this.telegram.sendMessage(this.chatId, this.t('launch_expired'))
+    this._continueMenu = null
+    const name = exec.workflowName ?? exec.workflowId
+    return this.startWorkflow(menu.sessionId, {
+      workflowId: exec.workflowId,
+      resumeFrom: exec.currentStepId,
+      stepOutput: exec.stepOutput ?? {},
+      ...(exec.params && Object.keys(exec.params).length > 0 ? { params: exec.params } : {}),
+      ...(exec.subGroup ? { subGroup: exec.subGroup } : {}),
+      ...(choice ? { userChoice: choice.id } : {}),
+      name,
+      label: choice ? `${name} · ${choice.label ?? choice.id}` : name,
+    })
+  }
+
+  /**
+   * Run a command of OpenFox on the active session, as the web UI's commands
+   * menu does ("Add criteria": the agent adds the criteria it proposed). Its
+   * agent first, if it has one; the turn is not awaited (a button's callback).
+   */
+  async runAgentCommand(commandId) {
+    const sessionId = this.state.sessionId
+    if (!sessionId) {
+      return this.telegram.sendMessage(this.chatId, this.t('no_active_session'), { reply_markup: menuKeyboard({ session: false }) })
+    }
+    let command
+    try {
+      const detail = await this.rest.getSessionDetail(sessionId)
+      command = await this.rest.getCommand(commandId, detail?.session?.workdir)
+      if (!command?.prompt) throw new Error(`no command ${commandId}`)
+      const agent = command.metadata?.agentMode
+      if (agent && detail?.session?.mode !== agent) await this.rest.setSessionMode(sessionId, agent)
+    } catch (e) {
+      return this.telegram.sendMessage(this.chatId, this.t('command_failed', { err: e?.message ?? 'error' }))
+    }
+    const kind = { messageKind: 'command' }
+    if (this.isTurnRunning()) return this.queueText(command.prompt, undefined, kind)
+    if (this._watcher?.busy && this._watcher.sessionId === sessionId) return this.queueOnWatched(command.prompt, undefined, kind)
+    await this.telegram.sendMessage(this.chatId, this.t('command_sent', { name: command.metadata?.name ?? commandId }))
+    void this.runTurn(sessionId, command.prompt, undefined, kind).catch((e) =>
+      this.telegram.sendMessage(this.chatId, `⚠️ ${e?.message ?? 'error'}`),
+    )
+  }
+
+  /** A launch button: wfl starts a workflow, wfs shows its steps, wfg starts one step. */
+  async _onLaunchCallback(data) {
+    const [kind, gen, index, step] = data.split(':')
+    const menu = this._launchMenu
+    const workflow = menu && String(menu.gen) === gen ? menu.workflows[Number(index)] : null
+    if (!workflow) return this.telegram.sendMessage(this.chatId, this.t('launch_expired'))
+    const name = workflow.name ?? workflow.id
+    if (kind === 'wfs') {
+      const rows = [
+        [{ text: this.t('btn_workflow_full'), callback_data: `wfl:${gen}:${index}` }],
+        ...(workflow.subGroups ?? []).map((sg, k) => [{ text: sg, callback_data: `wfg:${gen}:${index}:${k}` }]),
+        [{ text: this.t('btn_criteria_close'), callback_data: 'crit:close' }],
+      ]
+      return this.telegram.sendMessage(this.chatId, this.t('workflow_steps', { name }), { reply_markup: { inline_keyboard: rows } })
+    }
+    const subGroup = kind === 'wfg' ? workflow.subGroups?.[Number(step)] : undefined
+    if (kind === 'wfg' && !subGroup) return this.telegram.sendMessage(this.chatId, this.t('launch_expired'))
+    return this.startWorkflow(menu.sessionId, {
+      workflowId: workflow.id,
+      ...(subGroup ? { subGroup } : {}),
+      scope: workflow.scope ?? 'auto',
+      name,
+      label: subGroup ? `${name} · ${subGroup}` : name,
+    })
+  }
+
+  /** Start a workflow and follow it like a turn, without holding the bot (the callback returns at once). */
+  async startWorkflow(sessionId, launch) {
+    // A turn started here runs: OpenFox queues the workflow after it, this turn goes on.
+    if (this._turn) {
+      const { label, name, ...request } = launch
+      try {
+        const started = await this.rest.launchWorkflow(sessionId, request)
+        return this.telegram.sendMessage(this.chatId, this.t(started?.status === 'queued' ? 'workflow_queued' : 'workflow_started', { name: label }))
+      } catch (e) {
+        return this.telegram.sendMessage(this.chatId, this.t('workflow_failed', { err: e?.message ?? 'error' }))
+      }
+    }
+    void this.runTurn(sessionId, null, null, { launch }).catch((e) => {
+      this.logger.warn('telegram: workflow launch failed', { sessionId, error: e?.message })
+      return this.telegram.sendMessage(this.chatId, this.t('workflow_failed', { err: e?.message ?? 'error' }))
+    })
+  }
+
   async handleCallback(data) {
     try {
       return await this._handleCallback(data)
@@ -2156,6 +2827,19 @@ export class Conversation {
       }
     }
     if (/^(prv|mdl|mpg|mpb|mdf|mcx):/.test(data)) return this._onPickerCallback(data)
+    if (/^(wfl|wfs|wfg):/.test(data)) return this._onLaunchCallback(data)
+    if (data.startsWith('wfc:')) return this._onContinueCallback(data)
+    // Cancel: the runtime removes the buttons, the criteria stay in the chat.
+    if (data === 'crit:close') return
+    if (data === 'crit:view') return this.showCriteria()
+    if (data === 'crit:agent') return this.runAgentCommand('add-criteria')
+    if (data === 'crit:add') {
+      if (!this.state.sessionId) {
+        return this.telegram.sendMessage(this.chatId, this.t('no_active_session'), { reply_markup: menuKeyboard({ session: false }) })
+      }
+      this._criteriaInput = { sessionId: this.state.sessionId }
+      return this.telegram.sendMessage(this.chatId, this.t('criteria_add_prompt'))
+    }
     if (data.startsWith('ask:')) {
       // ask:<token>:<choice>
       const [, token, choice] = data.split(':')
@@ -2226,7 +2910,7 @@ export function wsUrl(baseUrl) {
 
 export function createWsSubscribe(baseUrl, logger = noopLogger) {
   const url = wsUrl(baseUrl)
-  return (sessionId, onEvent, { onClose } = {}) => {
+  return (sessionId, onEvent, { onClose, onOpen } = {}) => {
     let ws
     let closed = false
     const cleanup = () => {
@@ -2247,6 +2931,7 @@ export function createWsSubscribe(baseUrl, logger = noopLogger) {
       try {
         ws.send(JSON.stringify({ id: 'load', type: 'session.load', payload: { sessionId } }))
       } catch {}
+      onOpen?.()
     })
     ws.addEventListener('message', (ev) => {
       if (closed) return
@@ -2256,8 +2941,14 @@ export function createWsSubscribe(baseUrl, logger = noopLogger) {
       } catch {
         return
       }
-      // Forward only the events the turn runner cares about. chat.thinking is
-      // deliberately excluded so reasoning can never leak to Telegram.
+      // OpenFox sends every session's events to every client: keep this session's.
+      if (msg?.sessionId && msg.sessionId !== sessionId) return
+      // The reasoning only says the agent is working: forwarded without its
+      // content, so it can never leak to Telegram.
+      if (msg?.type === 'chat.thinking') return onEvent({ type: 'chat.thinking', payload: {} })
+      // A command's output, likewise: activity only (a long command prints as it runs).
+      if (msg?.type === 'chat.tool_output') return onEvent({ type: 'chat.tool_output', payload: {} })
+      // Forward only the events the turn runner and the follow mode use.
       if (
         msg &&
         (msg.type === 'chat.delta' ||
@@ -2268,7 +2959,8 @@ export function createWsSubscribe(baseUrl, logger = noopLogger) {
           msg.type === 'chat.tool_call' ||
           msg.type === 'chat.tool_result' ||
           msg.type === 'chat.path_confirmation' ||
-          msg.type === 'chat.ask_user')
+          msg.type === 'chat.ask_user' ||
+          msg.type === 'session.running')
       ) {
         onEvent(msg)
       }
@@ -2424,7 +3116,7 @@ export function createRuntime({ telegram, rest, subscribe, logger, auth = {}, hi
     const plainDuringTurn = conv.isTurnRunning() && !KEYBOARD_COMMANDS[trimmed] && !isCommand(trimmed)
     // /status and /agents only read (or offer a list): no need to wait either.
     const command = KEYBOARD_COMMANDS[trimmed] ?? trimmed
-    const immediate = command === '/stop' || command === '/status' || command === '/agents'
+    const immediate = command === '/stop' || command === '/status' || command === '/agents' || command === '/criteria'
     if (immediate || conv.hasPendingQuestion() || plainDuringTurn) void handle()
     else void runInOrder(chatId, handle)
   }

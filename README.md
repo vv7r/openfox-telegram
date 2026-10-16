@@ -25,7 +25,7 @@ The keys under the input:
 | 🤖 agents | Switches between builder and planner, toggles night mode |
 | 📊 status | Project, session, agent, model, night mode, activity, context used |
 
-Without an active session, only ▶️ start is shown. Typing `/` lists the commands, in French or English: the four keys, plus `/model` (switch the session's model: providers by name, 10 models per page, type a word to filter), `/sessions` (sessions of the project), `/new` (new project) and `/new_session` (new session).
+Without an active session, only ▶️ start is shown. Typing `/` lists the commands, in French or English: the four keys, plus `/model` (switch the session's model: providers by name, 10 models per page, type a word to filter), `/criteria` (see below), `/sessions` (sessions of the project), `/new` (new project) and `/new_session` (new session).
 
 A plain message goes to the active session. While the agent works:
 
@@ -36,7 +36,15 @@ A plain message goes to the active session. While the agent works:
 At the end of a turn:
 
 - the answer is formatted (bold, code, lists, links); beyond 7,000 characters it comes as a `reponse.md` file;
-- the files the agent changed are summed up: `📝 3 files changed (+45 −12)`, with the list.
+- the files the agent changed are summed up: `📝 3 files changed (+45 −12)`, with the list;
+- while the session has pending criteria, the build buttons follow, as under the web UI's conversation.
+
+Criteria and build, as in the web UI:
+
+- `/criteria` lists the session's acceptance criteria with their state (⏳ pending, 🔄 in progress, ☑️ completed, ✅ passed, ❌ failed); ➕ Add takes the next message as new criteria, one per line; 🤖 Add the proposed criteria runs OpenFox's "Add criteria" command: the agent adds the criteria it proposed (as from the web UI's commands menu); ✖ Cancel removes the buttons and keeps the list (a tapped button goes away too);
+- while criteria are pending, one ▶ button per workflow (e.g. ▶ Build & Verify) starts it; ⋮ starts a single step of it. Workflows with parameters are started from the web UI;
+- a workflow is followed to its end, through all its steps (builder, verifier…), then its summary is shown as in the web UI (`🏁 Build & Verify finished`, iterations, time, tool calls, tokens, speed) with the criteria counted by state; `⏹ stop` stops it;
+- a workflow paused on a step that waits for you (e.g. "Where to work") shows its choices as buttons.
 
 Photos and files (images, PDFs, text and code files, up to 20 MB) are sent to the session as attachments, with their caption.
 
